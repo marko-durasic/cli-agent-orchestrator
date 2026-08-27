@@ -119,6 +119,57 @@ _CHROME_LINE = re.compile(
 # leading digit), but never accept pattern syntax or structural punctuation.
 _MCP_SERVER_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
+# Endpoint overrides Grok reads from the ambient environment.  CAO runs Grok
+# against the user's own xAI session -- ``auth.json`` is symlinked into the
+# private ``GROK_HOME`` -- so an inherited base URL points session-authenticated
+# turns at a third party.  In practice that is not hypothetical: a local model
+# gateway exported into the operator's shell (for example Headroom, which sets
+# ``GROK_MODELS_BASE_URL`` and a per-model ``GROK_MODEL_GROK_BUILD_BASE_URL``)
+# is inherited by every CAO Grok terminal, which then fails every turn with
+# "Authentication required -- ... Run /login to re-authenticate" while the
+# credentials themselves are valid.  The private ``GROK_HOME`` isolates Grok's
+# config file but cannot isolate its environment, so scrub these on launch.
+#
+# Deliberately out of scope: ``GROK_TRACE_UPLOAD_*`` and the ``OTEL_*``
+# exporters.  Those are telemetry sinks rather than inference, auth, or config
+# endpoints, and CAO does not otherwise manage a terminal's telemetry.
+_ENDPOINT_OVERRIDE_VARS = frozenset(
+    {
+        "GROK_CLI_BASE_URL",
+        "GROK_CLI_CHAT_PROXY_BASE_URL",
+        "GROK_CONVERSATIONS_BASE_URL",
+        "GROK_FEEDBACK_BASE_URL",
+        "GROK_MANAGED_CONFIG_URL",
+        "GROK_MODELS_BASE_URL",
+        "GROK_MODELS_LIST_URL",
+        "GROK_MODES_BASE_URL",
+        "GROK_SKILLS_BASE_URL",
+        "GROK_WORKSPACES_BASE_URL",
+        "GROK_XAI_API_BASE_URL",
+    }
+)
+# Grok also derives per-model endpoint overrides from the model name at
+# runtime, so the exact variable names cannot be enumerated ahead of time.
+_PER_MODEL_ENDPOINT_VAR = re.compile(r"^GROK_MODEL_[A-Z0-9_]+_(?:BASE_URL|LIST_URL)$")
+# Escape hatch for a deployment that genuinely runs Grok against a custom
+# OpenAI-compatible endpoint (Grok's documented setup pairs
+# ``GROK_MODELS_BASE_URL`` with ``XAI_API_KEY``) and wants CAO terminals to
+# inherit it.
+_INHERIT_ENDPOINT_ENV = "CAO_GROK_INHERIT_MODEL_ENDPOINT"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _inherited_endpoint_overrides(environ: Optional[dict[str, str]] = None) -> list[str]:
+    """Return ambient Grok endpoint overrides that a CAO launch must scrub."""
+    env = os.environ if environ is None else environ
+    if env.get(_INHERIT_ENDPOINT_ENV, "").strip().lower() in _TRUTHY:
+        return []
+    return sorted(
+        name
+        for name in env
+        if name in _ENDPOINT_OVERRIDE_VARS or _PER_MODEL_ENDPOINT_VAR.match(name)
+    )
+
 
 def _toml_string(value: Any) -> str:
     """Serialize a scalar as a TOML-compatible basic string."""
@@ -427,8 +478,19 @@ class GrokCliProvider(BaseProvider):
         # explicitly; unrestricted allowedTools is a tool policy, not consent
         # to bypass CAO orchestration.
         native_workflows = bool(profile and profile.grokNativeWorkflows)
-        command_parts = [
-            "env",
+        command_parts = ["env"]
+        scrubbed = _inherited_endpoint_overrides()
+        if scrubbed:
+            logger.info(
+                "Scrubbing inherited Grok endpoint overrides for terminal %s: %s "
+                "(set %s=1 to inherit them instead)",
+                self.terminal_id,
+                ", ".join(scrubbed),
+                _INHERIT_ENDPOINT_ENV,
+            )
+        for name in scrubbed:
+            command_parts.extend(["-u", name])
+        command_parts += [
             f"GROK_HOME={home}",
             f"GROK_SUBAGENTS={int(native_workflows)}",
             f"GROK_WORKFLOWS={int(native_workflows)}",

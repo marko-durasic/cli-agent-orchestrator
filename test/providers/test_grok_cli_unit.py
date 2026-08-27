@@ -14,10 +14,12 @@ import pytest
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.grok_cli import (
+    _INHERIT_ENDPOINT_ENV,
     _STATUS_TAIL_CHARS,
     DIRECTORY_TRUST_PATTERN,
     GrokCliProvider,
     ProviderError,
+    _inherited_endpoint_overrides,
 )
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor, status_monitor
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -519,6 +521,103 @@ def test_profile_can_explicitly_enable_native_grok_workflows(tmp_path):
     assert "GROK_SUBAGENTS=1" in parts
     assert "GROK_WORKFLOWS=1" in parts
     assert "GROK_GOAL=1" in parts
+    provider.cleanup()
+
+
+def test_grok_1_0_5_responding_state_is_processing():
+    """Grok 1.0.5 renamed the in-flight spinner label from 1.0.0.
+
+    1.0.0 showed ``Waiting for response…``; 1.0.5 shows ``Responding…``.  The
+    braille-spinner-plus-ellipsis alternative in ``PROCESSING_PATTERN`` covers
+    the new label without naming it, and the ``[stop]`` / ``Esc:cancel``
+    affordances are still rendered.  Captured from a live pane on grok 1.0.5.
+    """
+    output = load_fixture("grok_cli_1_0_5_responding.txt")
+    assert "Responding…" in output
+    assert "Waiting for response" not in output
+    assert make_provider().get_status(output) == TerminalStatus.PROCESSING
+
+
+def test_inherited_endpoint_overrides_selects_only_endpoint_variables():
+    environ = {
+        # Redirect inference, auth, or config away from the session CAO reuses.
+        "GROK_MODELS_BASE_URL": "http://127.0.0.1:8788/v1",
+        "GROK_MODELS_LIST_URL": "http://127.0.0.1:8788/v1/models",
+        "GROK_CLI_CHAT_PROXY_BASE_URL": "https://proxy.example/v1",
+        "GROK_MANAGED_CONFIG_URL": "https://config.example/managed.toml",
+        # Derived from the model name at runtime, so matched by pattern.
+        "GROK_MODEL_GROK_BUILD_BASE_URL": "http://127.0.0.1:8788/v1",
+        # Not endpoints: CAO sets these itself or does not manage them.
+        "GROK_HOME": "/tmp/grok-home",
+        "GROK_SUBAGENTS": "0",
+        "GROK_SANDBOX": "strict",
+        "GROK_TRACE_UPLOAD_URL": "https://traces.example",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "https://otel.example",
+        "PATH": "/usr/bin",
+    }
+    assert _inherited_endpoint_overrides(environ) == [
+        "GROK_CLI_CHAT_PROXY_BASE_URL",
+        "GROK_MANAGED_CONFIG_URL",
+        "GROK_MODELS_BASE_URL",
+        "GROK_MODELS_LIST_URL",
+        "GROK_MODEL_GROK_BUILD_BASE_URL",
+    ]
+
+
+def test_inherited_endpoint_overrides_empty_when_nothing_is_set():
+    assert _inherited_endpoint_overrides({"PATH": "/usr/bin"}) == []
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", " yes ", "on"])
+def test_inherited_endpoint_overrides_opt_out_preserves_environment(value):
+    environ = {
+        "GROK_MODELS_BASE_URL": "https://api.acme.com/v1",
+        "XAI_API_KEY": "xai-test",
+        _INHERIT_ENDPOINT_ENV: value,
+    }
+    assert _inherited_endpoint_overrides(environ) == []
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "no"])
+def test_inherited_endpoint_overrides_opt_out_ignores_non_truthy(value):
+    environ = {"GROK_MODELS_BASE_URL": "https://api.acme.com/v1", _INHERIT_ENDPOINT_ENV: value}
+    assert _inherited_endpoint_overrides(environ) == ["GROK_MODELS_BASE_URL"]
+
+
+def test_build_command_scrubs_inherited_endpoint_overrides(tmp_path, monkeypatch):
+    monkeypatch.delenv(_INHERIT_ENDPOINT_ENV, raising=False)
+    monkeypatch.setenv("GROK_MODELS_BASE_URL", "http://127.0.0.1:8788/v1")
+    monkeypatch.setenv("GROK_MODEL_GROK_BUILD_BASE_URL", "http://127.0.0.1:8788/v1")
+    provider = make_provider()
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch("cli_agent_orchestrator.providers.grok_cli.shutil.which", return_value="/bin/grok"),
+    ):
+        parts = shlex.split(provider._build_grok_command())
+
+    assert parts[0] == "env"
+    for name in ("GROK_MODELS_BASE_URL", "GROK_MODEL_GROK_BUILD_BASE_URL"):
+        assert parts[parts.index(name) - 1] == "-u"
+        # The removal must precede the assignments and the binary, or `env`
+        # would unset a variable CAO had just set.
+        assert parts.index(name) < parts.index(f"GROK_HOME={provider.grok_home}")
+        assert parts.index(name) < parts.index("/bin/grok")
+    provider.cleanup()
+
+
+def test_build_command_keeps_endpoint_overrides_when_opted_in(tmp_path, monkeypatch):
+    monkeypatch.setenv("GROK_MODELS_BASE_URL", "https://api.acme.com/v1")
+    monkeypatch.setenv(_INHERIT_ENDPOINT_ENV, "1")
+    provider = make_provider()
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch("cli_agent_orchestrator.providers.grok_cli.shutil.which", return_value="/bin/grok"),
+    ):
+        parts = shlex.split(provider._build_grok_command())
+
+    assert "-u" not in parts
+    assert parts[0] == "env"
+    assert f"GROK_HOME={provider.grok_home}" in parts
     provider.cleanup()
 
 

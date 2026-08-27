@@ -162,6 +162,42 @@ fails startup with an actionable error. Review and remove project-local
 configuration such as `.mcp.json` or `.grok/` before launching the CAO
 terminal, or use standalone Grok when you intentionally want to trust it.
 
+## Endpoint Isolation
+
+A private `GROK_HOME` isolates Grok's configuration file, but it cannot isolate
+Grok's environment. Grok also reads its endpoints from environment variables,
+and a CAO terminal inherits whatever the `cao-server` process was started with.
+Because CAO reuses the user's own xAI session rather than a separate API key,
+an inherited base URL sends session-authenticated turns to a third party — in
+practice a local model gateway exported into the operator's shell, which makes
+every Grok terminal fail with `Authentication required` while the credentials
+themselves are valid.
+
+CAO therefore removes these variables from the launch environment:
+
+| Variable | Purpose |
+|----------|---------|
+| `GROK_MODELS_BASE_URL` | Inference and chat completions base URL |
+| `GROK_MODELS_LIST_URL` | Model list URL |
+| `GROK_MODEL_<MODEL>_BASE_URL` | Per-model endpoint override |
+| `GROK_CLI_BASE_URL` | CLI service base URL |
+| `GROK_CLI_CHAT_PROXY_BASE_URL` | Chat proxy base URL |
+| `GROK_XAI_API_BASE_URL` | xAI API base URL |
+| `GROK_CONVERSATIONS_BASE_URL` | Conversations service |
+| `GROK_WORKSPACES_BASE_URL` | Workspaces service |
+| `GROK_MODES_BASE_URL` | Modes service |
+| `GROK_SKILLS_BASE_URL` | Skills service |
+| `GROK_FEEDBACK_BASE_URL` | Feedback service |
+| `GROK_MANAGED_CONFIG_URL` | Managed configuration source |
+
+Telemetry sinks (`GROK_TRACE_UPLOAD_*`, `OTEL_*`) are left alone; CAO does not
+otherwise manage a terminal's telemetry.
+
+To run CAO terminals against a custom OpenAI-compatible endpoint on purpose —
+Grok's documented setup pairs `GROK_MODELS_BASE_URL` with `XAI_API_KEY` — start
+`cao-server` with `CAO_GROK_INHERIT_MODEL_ENDPOINT=1` and the variables are
+inherited unchanged. Each scrubbed launch logs the variable names it removed.
+
 ## Tool Restrictions
 
 Grok is a hard-enforcement provider. CAO translates missing capabilities into
@@ -227,6 +263,12 @@ Run `grok login` and `grok models` outside CAO. On a headless host, use
 `grok login --device-auth` or set `XAI_API_KEY`. If a profile selects an
 unavailable model, replace it with an ID printed by `grok models`.
 
+If Grok reports `Authentication required — your session has expired or your
+credentials were rejected` but the same account works in a standalone `grok`
+pane, compare the two environments before re-authenticating: the model footer
+reading `unknown` instead of a model name is the tell that Grok reached a
+different endpoint. See [Endpoint Isolation](#endpoint-isolation).
+
 ### MCP tools are missing or time out
 
 Confirm `cao-mcp-server` is installed in the same environment as `cao-server`.
@@ -235,8 +277,9 @@ so CAO regenerates its isolated config and terminal ID.
 
 ### Terminal remains processing
 
-Attach to the tmux session and check whether Grok still shows
-`Waiting for response…` or `Esc:cancel`. If Grok is visibly settled but CAO
+Attach to the tmux session and check whether Grok still shows its in-flight
+spinner (`Waiting for response…` on 1.0.0, `Responding…` on 1.0.5) or
+`Esc:cancel`. If Grok is visibly settled but CAO
 does not report completion, include a scrubbed pane capture and `grok --version`
 in the bug report.
 

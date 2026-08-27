@@ -19,6 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Grok terminals no longer inherit endpoint overrides from the `cao-server`
+  environment. A private `GROK_HOME` isolates Grok's config file but not its
+  environment, so a model gateway exported into the operator's shell (for
+  example `GROK_MODELS_BASE_URL` plus a per-model
+  `GROK_MODEL_<MODEL>_BASE_URL`) was inherited by every Grok terminal. Because
+  CAO reuses the user's own xAI session rather than a separate API key, those
+  session-authenticated turns were sent to the inherited endpoint and every
+  turn failed with `Authentication required … Run /login to re-authenticate`
+  while the credentials were valid. The launch environment now removes the
+  Grok endpoint variables (inference, model list, per-model, CLI/chat-proxy,
+  xAI API, conversations, workspaces, modes, skills, feedback, and managed
+  config); telemetry sinks are left untouched. Set
+  `CAO_GROK_INHERIT_MODEL_ENDPOINT=1` to inherit them deliberately when running
+  against a custom OpenAI-compatible endpoint
 - tmux listing parse failures are retried once and reported as a distinct condition instead of surfacing as a bare `ValueError` that reads like "session not found" one layer up. libtmux 0.53.1+ zips `parse_output`'s fields with `strict=True`, so any short row (a pane or session vanishing mid-listing, or trailing fields tmux omits) raised `ValueError: zip() argument 2 is shorter than argument 1` — which propagated through `server.sessions`/`window.panes`, blocked launches outright, and left the pipe-liveness watchdog unable to tell a genuinely-gone session from a transient parse failure. Adds `TmuxLookupError` and routes the listing reads in `clients/tmux.py` through a single retry-and-classify wrapper; a failed `create_session` no longer leaves an orphaned tmux session that blocks relaunching the same name. Also caps `libtmux<0.53.1`, the last release that zips non-strict (caom-anv)
 - Codex handoff extraction now skips native TUI activity cells without relying on an English verb allowlist, including when the model's reply starts with prose (#545)
 - `list_sessions` ownership metadata now persists the effective canonical launch directory, stays stable after pane `cd`, and purges stale terminal rows before same-name session relaunches so reused sessions report the new directory/profile (#497)
