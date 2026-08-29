@@ -13,6 +13,7 @@ from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
 from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
+from cli_agent_orchestrator.providers.ollama_cli import OllamaCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
@@ -164,6 +165,15 @@ class ProviderManager:
                     agent_profile,
                     allowed_tools,
                     skill_prompt=skill_prompt,
+                    model=model,
+                )
+            elif provider_type == ProviderType.OLLAMA_CLI.value:
+                provider = OllamaCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
                     model=model,
                 )
             elif provider_type == ProviderType.MINIMAX_CODE.value:

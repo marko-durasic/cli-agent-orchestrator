@@ -30,6 +30,7 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "copilot_cli",
     "cursor_cli",
     "grok_cli",
+    "ollama_cli",
     "hermes",
     "kimi_cli",
     "kiro_cli",
