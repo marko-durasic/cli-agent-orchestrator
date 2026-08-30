@@ -61,10 +61,20 @@ class TestStatusDetection:
         assert provider.get_status(out) == TerminalStatus.ERROR
 
     def test_open_multiline_is_not_idle(self, provider):
-        # Ollama's triple-quote mode swallows the next input into the string,
-        # so a task sent now would vanish rather than run.
-        out = '>>> """\n'
-        assert provider.get_status(out) == TerminalStatus.WAITING_USER_ANSWER
+        # Ollama's triple-quote mode swallows the next input into the string, so
+        # a task sent now would vanish rather than run. This fixture is a real
+        # capture: the opening quotes land on the prompt line after its hint,
+        # and the continuation prompt is what marks the open state.
+        assert provider.get_status(fixture("ollama_multiline_open_raw.txt")) == (
+            TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    def test_an_ellipsis_in_an_answer_does_not_forge_a_wait(self, provider):
+        # Without an opener in the buffer, a line starting with "..." is just
+        # the model trailing off mid-sentence.
+        assert provider.get_status(">>> tell me a story\n... and then") == (
+            TerminalStatus.PROCESSING
+        )
 
     def test_ansi_codes_do_not_break_detection(self, provider):
         coloured = f"\x1b[32m>>> \x1b[0mreply\n\x1b[1mPONG\x1b[0m\n{RETURNED}"

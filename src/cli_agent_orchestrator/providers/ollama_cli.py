@@ -70,20 +70,21 @@ RETURNED_PROMPT_PATTERN = re.compile(r">>> Send a message \(/\? for help\)\s*$")
 # redraws the prompt on the same line.
 INTERRUPTED_PATTERN = re.compile(r"\^C\s*$")
 
-# Multi-line paste mode: ollama echoes '"""' and waits for the closing quotes.
-# Treated as waiting-for-input rather than idle, because a task sent now would
-# be swallowed into the open string instead of running.
+# Multi-line paste mode, now captured from a real session rather than assumed.
+# The previous pattern looked for a line that is exactly '"""' and never
+# matched: the opening quotes are typed onto the prompt line, and the raw stream
+# does not erase the hint, so what actually appears is
 #
-# UNVERIFIED, unlike everything else here. The prompt, the answer format, the
-# pull progress and the exit command were all captured from the live REPL; this
-# branch was not — two attempts to type bare triple-quotes through nested shell
-# quoting sent escaped literals instead. The pattern is therefore deliberately
-# permissive (with or without the ">>> " prefix), and errs toward
-# WAITING_USER_ANSWER, which costs a pause rather than a lost task. Worth
-# confirming against a real multi-line session before relying on it.
-# Matched with or without the prompt prefix: the opening quotes are typed on
-# the prompt line (">>> \"\"\""), and later renders may show them alone.
-MULTILINE_OPEN_PATTERN = r'^(?:>>>\s*)?"""\s*$'
+#     >>> Send a message (/? for help)"""
+#     ... Press Enter to send
+#
+# The reliable signal is the continuation prompt "..." at the end of the buffer.
+# It is only trusted when a '"""' opener appears earlier in the same buffer,
+# because a model answer can end a line with an ellipsis and would otherwise
+# forge a wait. A task sent while this is open would be swallowed into the
+# string instead of running, so it must not read as idle.
+MULTILINE_OPEN_MARKER = '"""'
+MULTILINE_CONTINUATION_PATTERN = r"^\.\.\."
 
 # Model pull progress. A cold model downloads gigabytes before the prompt
 # appears, and that is PROCESSING, not a hang.
@@ -178,8 +179,12 @@ class OllamaCliProvider(BaseProvider):
 
         # An open triple-quote swallows whatever is sent next, so it must not
         # look idle.
-        tail = "\n".join(clean.splitlines()[-40:])
-        if re.search(MULTILINE_OPEN_PATTERN, tail, re.MULTILINE):
+        non_empty = [line for line in clean.splitlines() if line.strip()]
+        if (
+            non_empty
+            and re.match(MULTILINE_CONTINUATION_PATTERN, non_empty[-1])
+            and MULTILINE_OPEN_MARKER in clean
+        ):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # Ollama hands control back by rendering its prompt and nothing after
