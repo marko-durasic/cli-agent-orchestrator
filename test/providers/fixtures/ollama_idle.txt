@@ -1,2 +1,3 @@
-dureef@ip-172-31-93-223:~/workspace$ ollama run llama3.2:1b
+ollama run llama3.2:1b
+dureef@ip-172-31-93-223:~$ ollama run llama3.2:1b
 >>> Send a message (/? for help)
