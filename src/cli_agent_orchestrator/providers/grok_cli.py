@@ -460,7 +460,6 @@ class GrokCliProvider(BaseProvider):
         self._grok_home_root = home.parent
         return home
 
-
     def _inherit_folder_trust(self, home: Path) -> None:
         """Carry an EXISTING user trust decision into the private GROK_HOME.
 
@@ -507,21 +506,27 @@ class GrokCliProvider(BaseProvider):
 
         # Deliberately a narrow, literal match rather than a TOML parse: the
         # only decision copied is "this exact path was trusted".
+        # The store renders the path as a TOML basic string, so a path holding
+        # a backslash or a quote appears escaped. Matching the raw path would
+        # simply never find those entries.
+        toml_key = working_directory.replace("\\", "\\\\").replace('"', '\\"')
         pattern = re.compile(
-            r'\[folders\."' + re.escape(working_directory) + r'"\]\s*\n\s*trusted\s*=\s*true',
+            r'\[folders\."' + re.escape(toml_key) + r'"\]\s*\n\s*trusted\s*=\s*(true|false)',
             re.MULTILINE,
         )
-        if not pattern.search(raw):
+        entries = list(pattern.finditer(raw))
+        # A store holding both true and false for the same path is ambiguous
+        # about what the human decided. Refusing costs a trust dialog; guessing
+        # could run repository-defined code they declined.
+        if not entries or any(match.group(1) != "true" for match in entries):
             return
 
-        block = (
-            f'[folders."{working_directory}"]\n'
-            "trusted = true\n"
-        )
+        # Write back the matched text verbatim rather than re-rendering the
+        # path into a quoted TOML key: a path containing a quote or backslash
+        # would be re-emitted as malformed TOML, corrupting the private store.
+        block = entries[0].group(0).strip() + "\n"
         self._atomic_write_private(home / "trusted_folders.toml", block)
-        logger.info(
-            "grok: inherited the user's existing trust decision for %s", working_directory
-        )
+        logger.info("grok: inherited the user's existing trust decision for %s", working_directory)
 
     def _build_grok_command(self) -> str:
         binary = shutil.which("grok")

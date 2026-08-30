@@ -29,9 +29,7 @@ def provider(tmp_path):
 
 
 def _run_inherit(provider, home: Path, cwd: str):
-    with patch(
-        "cli_agent_orchestrator.providers.grok_cli.get_backend"
-    ) as backend:
+    with patch("cli_agent_orchestrator.providers.grok_cli.get_backend") as backend:
         backend.return_value.get_pane_working_directory.return_value = cwd
         provider._inherit_folder_trust(home)
 
@@ -62,9 +60,7 @@ def test_untrusted_directory_is_not_invented(provider, tmp_path, monkeypatch):
     workdir.mkdir()
     user_home = tmp_path / "dot_grok"
     user_home.mkdir()
-    (user_home / "trusted_folders.toml").write_text(
-        f'[folders."{workdir}"]\ntrusted = false\n'
-    )
+    (user_home / "trusted_folders.toml").write_text(f'[folders."{workdir}"]\ntrusted = false\n')
     monkeypatch.setenv("GROK_HOME", str(user_home))
 
     home = tmp_path / "private_home"
@@ -82,9 +78,7 @@ def test_unknown_directory_is_not_trusted(provider, tmp_path, monkeypatch):
     workdir.mkdir()
     user_home = tmp_path / "dot_grok"
     user_home.mkdir()
-    (user_home / "trusted_folders.toml").write_text(
-        f'[folders."{other}"]\ntrusted = true\n'
-    )
+    (user_home / "trusted_folders.toml").write_text(f'[folders."{other}"]\ntrusted = true\n')
     monkeypatch.setenv("GROK_HOME", str(user_home))
 
     home = tmp_path / "private_home"
@@ -104,3 +98,46 @@ def test_missing_user_store_is_harmless(provider, tmp_path, monkeypatch):
     _run_inherit(provider, home, str(workdir))
 
     assert not (home / "trusted_folders.toml").exists()
+
+
+def test_a_later_false_entry_wins_over_an_earlier_true(provider, tmp_path, monkeypatch):
+    # A store that says both things about one path is ambiguous. Refusing costs
+    # a trust dialog; guessing could run repository-defined code the human
+    # declined.
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    user_home = tmp_path / "dot_grok"
+    user_home.mkdir()
+    (user_home / "trusted_folders.toml").write_text(
+        f'[folders."{workdir}"]\ntrusted = true\n\n[folders."{workdir}"]\ntrusted = false\n'
+    )
+    monkeypatch.setenv("GROK_HOME", str(user_home))
+
+    home = tmp_path / "private_home"
+    home.mkdir(parents=True, exist_ok=True)
+    _run_inherit(provider, home, str(workdir))
+
+    assert not (home / "trusted_folders.toml").exists()
+
+
+def test_a_quoted_path_is_copied_verbatim_not_re_rendered(provider, tmp_path, monkeypatch):
+    # Re-rendering the path into a quoted TOML key would emit a bare quote and
+    # corrupt the private store. The matched text is copied as-is instead.
+    workdir = tmp_path / 'we"ird'
+    workdir.mkdir()
+    user_home = tmp_path / "dot_grok"
+    user_home.mkdir()
+    escaped = str(workdir).replace('"', '\\"')
+    (user_home / "trusted_folders.toml").write_text(f'[folders."{escaped}"]\ntrusted = true\n')
+    monkeypatch.setenv("GROK_HOME", str(user_home))
+
+    home = tmp_path / "private_home"
+    home.mkdir(parents=True, exist_ok=True)
+    _run_inherit(provider, home, str(workdir))
+
+    import tomllib
+
+    out = home / "trusted_folders.toml"
+    assert out.is_file(), "the decision exists, so it should still be inherited"
+    parsed = tomllib.loads(out.read_text())
+    assert parsed["folders"][str(workdir)]["trusted"] is True
