@@ -41,6 +41,11 @@ from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_confi
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
+try:  # Python 3.11+
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 — tomli is a declared dependency there
+    import tomli as tomllib  # type: ignore[no-redef]
+
 logger = logging.getLogger(__name__)
 
 
@@ -506,25 +511,42 @@ class GrokCliProvider(BaseProvider):
 
         # Deliberately a narrow, literal match rather than a TOML parse: the
         # only decision copied is "this exact path was trusted".
-        # The store renders the path as a TOML basic string, so a path holding
-        # a backslash or a quote appears escaped. Matching the raw path would
-        # simply never find those entries.
-        toml_key = working_directory.replace("\\", "\\\\").replace('"', '\\"')
-        pattern = re.compile(
-            r'\[folders\."' + re.escape(toml_key) + r'"\]\s*\n\s*trusted\s*=\s*(true|false)',
-            re.MULTILINE,
-        )
-        entries = list(pattern.finditer(raw))
-        # A store holding both true and false for the same path is ambiguous
-        # about what the human decided. Refusing costs a trust dialog; guessing
-        # could run repository-defined code they declined.
-        if not entries or any(match.group(1) != "true" for match in entries):
+        # Parse the store rather than pattern-matching it. A regex reads text
+        # that TOML does not: a commented-out header still looks like a table
+        # header to a pattern, and pairing one with the next `trusted = true`
+        # line granted trust for a directory the human never approved. The
+        # parser sees comments and string bodies for what they are, and it
+        # rejects a file that defines the same table twice — so a contradictory
+        # store fails closed instead of resolving to whichever entry came
+        # first.
+        try:
+            store = tomllib.loads(raw)
+        except Exception:
             return
 
-        # Write back the matched text verbatim rather than re-rendering the
-        # path into a quoted TOML key: a path containing a quote or backslash
-        # would be re-emitted as malformed TOML, corrupting the private store.
-        block = entries[0].group(0).strip() + "\n"
+        folders = store.get("folders")
+        if not isinstance(folders, dict):
+            return
+        entry = folders.get(working_directory)
+        # `is not True` rather than a falsy check: only the literal boolean
+        # counts, so "true", 1 or a nested table cannot stand in for a decision.
+        if not isinstance(entry, dict) or entry.get("trusted") is not True:
+            return
+
+        toml_key = working_directory.replace("\\", "\\\\").replace('"', '\\"')
+        block = f'[folders."{toml_key}"]\ntrusted = true\n'
+
+        # Whatever is written must parse back to this exact decision. A path
+        # holding a control character or a stray quote would otherwise be
+        # emitted as malformed TOML and corrupt the private store; here it
+        # simply fails closed.
+        try:
+            rendered = tomllib.loads(block)
+        except Exception:
+            rendered = None
+        if rendered != {"folders": {working_directory: {"trusted": True}}}:
+            return
+
         self._atomic_write_private(home / "trusted_folders.toml", block)
         logger.info("grok: inherited the user's existing trust decision for %s", working_directory)
 
