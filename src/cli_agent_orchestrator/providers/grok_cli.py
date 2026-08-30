@@ -454,10 +454,74 @@ class GrokCliProvider(BaseProvider):
         if auth_source.is_file() and not auth_link.exists():
             auth_link.symlink_to(auth_source)
 
+        self._inherit_folder_trust(home)
         self._atomic_write_private(home / "config.toml", self._render_mcp_config(mcp_servers))
         self._grok_home = home
         self._grok_home_root = home.parent
         return home
+
+
+    def _inherit_folder_trust(self, home: Path) -> None:
+        """Carry an EXISTING user trust decision into the private GROK_HOME.
+
+        CAO gives every terminal a private GROK_HOME, which has no folder-trust
+        decisions — so Grok asks for trust on any directory holding
+        repository-local MCP, LSP or hooks config, and initialize() refuses to
+        answer it. That refusal is correct: CAO must never grant permission to
+        run repository-defined code on the human's behalf.
+
+        But it also means a directory the human ALREADY trusted, deliberately,
+        in their own ~/.grok can never be used from CAO — which is how a
+        workspace containing an ordinary .cursor/mcp.json became unspawnable
+        while the same directory ran fine in a bare `grok`.
+
+        So this copies a decision, it does not make one. Only an entry that
+        already exists for this exact working directory, and only when it says
+        trusted; anything else is left absent so the dialog still appears and
+        initialize() still refuses. An untrusted or unknown directory is
+        unchanged.
+        """
+        try:
+            cwd = get_backend().get_pane_working_directory(self.session_name, self.window_name)
+            if not cwd:
+                return
+            working_directory = str(Path(cwd).resolve())
+        except Exception:
+            # Never let a trust lookup stop a terminal coming up; without the
+            # inherited decision the dialog simply appears and initialize()
+            # refuses, which is the pre-existing behaviour.
+            return
+
+        configured_home = os.environ.get("GROK_HOME", "").strip()
+        source_root = (
+            Path(configured_home).expanduser() if configured_home else Path.home() / ".grok"
+        )
+        source = source_root / "trusted_folders.toml"
+        if not source.is_file() or source.resolve() == (home / "trusted_folders.toml").resolve():
+            return
+
+        try:
+            raw = source.read_text(encoding="utf-8")
+        except OSError:
+            return
+
+        # Deliberately a narrow, literal match rather than a TOML parse: the
+        # only decision copied is "this exact path was trusted".
+        pattern = re.compile(
+            r'\[folders\."' + re.escape(working_directory) + r'"\]\s*\n\s*trusted\s*=\s*true',
+            re.MULTILINE,
+        )
+        if not pattern.search(raw):
+            return
+
+        block = (
+            f'[folders."{working_directory}"]\n'
+            "trusted = true\n"
+        )
+        self._atomic_write_private(home / "trusted_folders.toml", block)
+        logger.info(
+            "grok: inherited the user's existing trust decision for %s", working_directory
+        )
 
     def _build_grok_command(self) -> str:
         binary = shutil.which("grok")
