@@ -16,6 +16,7 @@ from cli_agent_orchestrator.providers.ollama_cli import (
     DEFAULT_MODEL,
     OllamaCliProvider,
 )
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -64,12 +65,69 @@ class TestStatusDetection:
         coloured = "\x1b[32m>>> \x1b[0mreply\n\x1b[1mPONG\x1b[0m\n>>> "
         assert provider.get_status(coloured) == TerminalStatus.COMPLETED
 
+    def test_repl_transcript_in_an_answer_does_not_forge_completion(self, provider):
+        # Small local models answer "show me a python repl" with literal ">>>"
+        # lines. Matching a prompt anywhere in the buffer read that as a
+        # finished turn and handed the caller half an answer.
+        streaming = (
+            ">>> show me a python repl example\n"
+            "Sure:\n"
+            ">>> print(1)\n"
+            "1\n"
+            "and it keeps going"
+        )
+        assert provider.get_status(streaming) == TerminalStatus.PROCESSING
+
+    def test_a_repl_line_at_the_buffer_edge_is_not_a_returned_prompt(self, provider):
+        # The stream happens to stop on a ">>>" line from the model's own
+        # transcript. Only the strict idle prompt (bare, or with the "Send a
+        # message" hint) means ollama handed control back.
+        assert provider.get_status(">>> repl please\nlike this:\n>>> print(1)") == (
+            TerminalStatus.PROCESSING
+        )
+
+    def test_answer_still_streaming_is_processing_not_idle(self, provider):
+        # IDLE would advertise the terminal as free and let a second task land
+        # on top of the running one.
+        assert provider.get_status(">>> hello\npartial ans") == TerminalStatus.PROCESSING
+
+    def test_long_answer_that_rolled_the_buffer_is_still_completed(self, provider):
+        # An answer larger than state_buffer_max drops the prompt that opened
+        # the turn, leaving no positional evidence. grok_cli takes the same
+        # at_rolling_capacity precaution; without it a big answer reports IDLE
+        # and is never harvested.
+        capacity = get_server_settings()["state_buffer_max"]
+        rolled = ("answer text " * (capacity // 12 + 1)) + "\n>>> "
+        assert len(rolled) >= capacity
+        assert provider.get_status(rolled) == TerminalStatus.COMPLETED
+
+    def test_a_rolled_buffer_of_blank_lines_is_not_an_answer(self, provider):
+        # At capacity but with nothing in it. Whitespace is not a completed
+        # turn, and claiming one would hand the caller an empty message.
+        capacity = get_server_settings()["state_buffer_max"]
+        assert provider.get_status("\n" * capacity + ">>> ") == TerminalStatus.IDLE
+
+    def test_headless_buffer_below_capacity_is_not_assumed_complete(self, provider):
+        # Same shape, but the buffer never filled, so nothing was dropped and
+        # there is no honest reason to claim a turn finished.
+        assert provider.get_status("stray text\n>>> ") == TerminalStatus.IDLE
+
+    def test_a_redrawn_prompt_with_nothing_typed_stays_idle(self, provider):
+        # The hint prompt then a bare redraw. Nothing was sent, so there is no
+        # turn to complete.
+        assert provider.get_status(">>> Send a message (/? for help)\n>>> ") == (
+            TerminalStatus.IDLE
+        )
+
+    def test_empty_answer_still_completes_the_turn(self, provider):
+        # The model returned nothing, but the turn is over. IDLE here would
+        # look like the task was never dispatched.
+        assert provider.get_status(">>> hi\n>>> ") == TerminalStatus.COMPLETED
+
 
 class TestMessageExtraction:
     def test_extracts_the_answer_without_the_echoed_input(self, provider):
-        assert provider.extract_last_message_from_script(
-            fixture("ollama_completed.txt")
-        ) == "PONG"
+        assert provider.extract_last_message_from_script(fixture("ollama_completed.txt")) == "PONG"
 
     def test_no_response_raises(self, provider):
         with pytest.raises(ValueError):

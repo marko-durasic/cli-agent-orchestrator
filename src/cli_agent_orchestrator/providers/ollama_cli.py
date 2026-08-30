@@ -72,11 +72,7 @@ PULLING_PATTERN = r"pulling\s+[0-9a-f]+|verifying sha256|writing manifest"
 
 # Fatal startup failures. Anything else is left to the caller rather than
 # guessed at, per the skill's warning against over-broad ERROR matching.
-ERROR_PATTERN = (
-    r"^Error:\s|"
-    r"model\s+'[^']+'\s+not found|"
-    r"could not connect to ollama"
-)
+ERROR_PATTERN = r"^Error:\s|" r"model\s+'[^']+'\s+not found|" r"could not connect to ollama"
 
 DEFAULT_MODEL = "llama3.2:3b"
 
@@ -161,18 +157,58 @@ class OllamaCliProvider(BaseProvider):
         if re.search(MULTILINE_OPEN_PATTERN, tail, re.MULTILINE):
             return TerminalStatus.WAITING_USER_ANSWER
 
-        prompts = list(re.finditer(IDLE_PROMPT_ANY_PATTERN, clean, re.MULTILINE))
-        if not prompts:
-            # No prompt yet: either still pulling the model or still answering.
+        # Ollama hands control back by rendering its prompt and nothing after
+        # it, so the ONLY trustworthy completion signal is a strict idle prompt
+        # on the last non-empty line. Matching a prompt anywhere in the buffer
+        # forges COMPLETED mid-generation as soon as the model emits a line
+        # starting with ">>>" -- a Python REPL transcript is enough, and small
+        # local models produce those constantly.
+        lines = clean.splitlines()
+        last_index = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
+        if last_index is None:
+            return TerminalStatus.UNKNOWN
+
+        last_line = lines[last_index]
+        returned_to_prompt = bool(
+            re.match(IDLE_PROMPT_PATTERN, last_line)
+            or re.match(IDLE_PROMPT_HINT_PATTERN, last_line)
+        )
+        if not returned_to_prompt:
+            # Still pulling the model, or still streaming an answer. Reporting
+            # IDLE here would advertise the terminal as free and let a second
+            # task land on top of a running one.
             return TerminalStatus.PROCESSING
 
-        # Text between the previous prompt and the last one is a completed
-        # answer. Ollama has no response marker, so this positional rule is the
-        # only honest signal available.
-        if len(prompts) >= 2:
-            between = clean[prompts[-2].end() : prompts[-1].start()]
-            if between.strip():
-                return TerminalStatus.COMPLETED
+        prompt_start = sum(len(line) + 1 for line in lines[:last_index])
+        head = clean[:prompt_start]
+
+        # Text between the prompt that opened this turn and the one that closed
+        # it is the answer. Ollama has no response marker, so this positional
+        # rule is the only honest signal available.
+        opening = [match for match in re.finditer(IDLE_PROMPT_ANY_PATTERN, head, re.MULTILINE)]
+        if opening:
+            line_end = head.find("\n", opening[-1].end())
+            if line_end == -1:
+                line_end = len(head)
+            # The rest of the opening prompt line is the echoed input, which
+            # counts as turn content -- unless it is the "Send a message" hint,
+            # which is chrome ollama prints when nothing has been typed.
+            typed = head[opening[-1].end() : line_end]
+            if re.match(IDLE_PROMPT_HINT_PATTERN, head[opening[-1].start() : line_end]):
+                typed = ""
+            body = typed + head[line_end:]
+            return TerminalStatus.COMPLETED if body.strip() else TerminalStatus.IDLE
+
+        # No opening prompt in the buffer. Either nothing has been sent yet, or
+        # the answer was long enough that the rolling buffer dropped the head
+        # (grok_cli takes the same at_rolling_capacity precaution). Without this
+        # check a large answer silently reports IDLE and the turn is never
+        # harvested.
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        at_rolling_capacity = len(buffer) >= get_server_settings()["state_buffer_max"]
+        if at_rolling_capacity and head.strip():
+            return TerminalStatus.COMPLETED
         return TerminalStatus.IDLE
 
     def extract_last_message_from_script(self, script_output: str) -> str:
