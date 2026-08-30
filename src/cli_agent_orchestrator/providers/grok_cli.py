@@ -41,6 +41,11 @@ from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_confi
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
+try:  # Python 3.11+
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 — tomli is a declared dependency there
+    import tomli as tomllib  # type: ignore[no-redef]
+
 logger = logging.getLogger(__name__)
 
 
@@ -454,10 +459,96 @@ class GrokCliProvider(BaseProvider):
         if auth_source.is_file() and not auth_link.exists():
             auth_link.symlink_to(auth_source)
 
+        self._inherit_folder_trust(home)
         self._atomic_write_private(home / "config.toml", self._render_mcp_config(mcp_servers))
         self._grok_home = home
         self._grok_home_root = home.parent
         return home
+
+    def _inherit_folder_trust(self, home: Path) -> None:
+        """Carry an EXISTING user trust decision into the private GROK_HOME.
+
+        CAO gives every terminal a private GROK_HOME, which has no folder-trust
+        decisions — so Grok asks for trust on any directory holding
+        repository-local MCP, LSP or hooks config, and initialize() refuses to
+        answer it. That refusal is correct: CAO must never grant permission to
+        run repository-defined code on the human's behalf.
+
+        But it also means a directory the human ALREADY trusted, deliberately,
+        in their own ~/.grok can never be used from CAO — which is how a
+        workspace containing an ordinary .cursor/mcp.json became unspawnable
+        while the same directory ran fine in a bare `grok`.
+
+        So this copies a decision, it does not make one. Only an entry that
+        already exists for this exact working directory, and only when it says
+        trusted; anything else is left absent so the dialog still appears and
+        initialize() still refuses. An untrusted or unknown directory is
+        unchanged.
+        """
+        try:
+            cwd = get_backend().get_pane_working_directory(self.session_name, self.window_name)
+            if not cwd:
+                return
+            working_directory = str(Path(cwd).resolve())
+        except Exception:
+            # Never let a trust lookup stop a terminal coming up; without the
+            # inherited decision the dialog simply appears and initialize()
+            # refuses, which is the pre-existing behaviour.
+            return
+
+        configured_home = os.environ.get("GROK_HOME", "").strip()
+        source_root = (
+            Path(configured_home).expanduser() if configured_home else Path.home() / ".grok"
+        )
+        source = source_root / "trusted_folders.toml"
+        if not source.is_file() or source.resolve() == (home / "trusted_folders.toml").resolve():
+            return
+
+        try:
+            raw = source.read_text(encoding="utf-8")
+        except OSError:
+            return
+
+        # Deliberately a narrow, literal match rather than a TOML parse: the
+        # only decision copied is "this exact path was trusted".
+        # Parse the store rather than pattern-matching it. A regex reads text
+        # that TOML does not: a commented-out header still looks like a table
+        # header to a pattern, and pairing one with the next `trusted = true`
+        # line granted trust for a directory the human never approved. The
+        # parser sees comments and string bodies for what they are, and it
+        # rejects a file that defines the same table twice — so a contradictory
+        # store fails closed instead of resolving to whichever entry came
+        # first.
+        try:
+            store = tomllib.loads(raw)
+        except Exception:
+            return
+
+        folders = store.get("folders")
+        if not isinstance(folders, dict):
+            return
+        entry = folders.get(working_directory)
+        # `is not True` rather than a falsy check: only the literal boolean
+        # counts, so "true", 1 or a nested table cannot stand in for a decision.
+        if not isinstance(entry, dict) or entry.get("trusted") is not True:
+            return
+
+        toml_key = working_directory.replace("\\", "\\\\").replace('"', '\\"')
+        block = f'[folders."{toml_key}"]\ntrusted = true\n'
+
+        # Whatever is written must parse back to this exact decision. A path
+        # holding a control character or a stray quote would otherwise be
+        # emitted as malformed TOML and corrupt the private store; here it
+        # simply fails closed.
+        try:
+            rendered = tomllib.loads(block)
+        except Exception:
+            rendered = None
+        if rendered != {"folders": {working_directory: {"trusted": True}}}:
+            return
+
+        self._atomic_write_private(home / "trusted_folders.toml", block)
+        logger.info("grok: inherited the user's existing trust decision for %s", working_directory)
 
     def _build_grok_command(self) -> str:
         binary = shutil.which("grok")
