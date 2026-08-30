@@ -36,6 +36,7 @@ from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
+from cli_agent_orchestrator.providers.ollama_cli import OllamaCliProvider
 from cli_agent_orchestrator.providers.omp import OmpProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
 
@@ -62,6 +63,7 @@ PROVIDERS = [
     pytest.param(ClaudeCodeProvider, None, id="claude_code"),
     pytest.param(GrokCliProvider, "_turns", id="grok_cli"),
     pytest.param(MiniMaxCodeProvider, "_has_received_input", id="mcode"),
+    pytest.param(OllamaCliProvider, None, id="ollama_cli"),
     pytest.param(MockCliProvider, None, id="mock_cli"),
 ]
 
