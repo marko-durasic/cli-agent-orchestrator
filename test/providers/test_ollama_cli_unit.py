@@ -65,6 +65,37 @@ class TestStatusDetection:
         coloured = "\x1b[32m>>> \x1b[0mreply\n\x1b[1mPONG\x1b[0m\n>>> "
         assert provider.get_status(coloured) == TerminalStatus.COMPLETED
 
+    def test_raw_pty_capture_of_a_finished_turn_is_completed(self, provider):
+        # The rolling buffer holds raw pipe-pane bytes, not a rendered screen.
+        # This fixture is a real ollama 0.33.2 session captured through
+        # tmux pipe-pane: spinner frames, synchronised-update and hide/show
+        # cursor sequences, and a prompt hint drawn with a 28-column cursor-back
+        # move. An SGR-only strip leaves those bytes in front of ">>> " and the
+        # finished turn reads as PROCESSING forever.
+        assert provider.get_status(fixture("ollama_completed_raw.txt")) == (
+            TerminalStatus.COMPLETED
+        )
+
+    def test_raw_pty_capture_at_the_prompt_is_idle(self, provider):
+        assert provider.get_status(fixture("ollama_idle_raw.txt")) == TerminalStatus.IDLE
+
+    @pytest.mark.parametrize(
+        "redraw",
+        [
+            pytest.param("\x1b[2K", id="erase_line"),
+            pytest.param("\x1b[?25l\x1b[2K\x1b[?25h", id="hide_cursor_erase_show"),
+            pytest.param("\r", id="carriage_return"),
+            pytest.param("\x1b[1G", id="cursor_to_column_1"),
+        ],
+    )
+    def test_a_redrawn_prompt_still_completes_the_turn(self, provider, redraw):
+        # readline redraws its prompt with cursor-control and erase sequences,
+        # not just colour. An SGR-only strip left those bytes in front of ">>> "
+        # so the returned prompt failed the line match and a finished turn read
+        # as PROCESSING forever.
+        buffer = f">>> hello\nhi there\n{redraw}>>> "
+        assert provider.get_status(buffer) == TerminalStatus.COMPLETED
+
     def test_repl_transcript_in_an_answer_does_not_forge_completion(self, provider):
         # Small local models answer "show me a python repl" with literal ">>>"
         # lines. Matching a prompt anywhere in the buffer read that as a

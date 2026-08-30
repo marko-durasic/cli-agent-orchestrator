@@ -38,6 +38,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +147,13 @@ class OllamaCliProvider(BaseProvider):
         if not buffer:
             return TerminalStatus.UNKNOWN
 
-        clean = re.sub(ANSI_CODE_PATTERN, "", buffer)
+        # strip_terminal_escapes, not an SGR-only strip: ollama's readline
+        # redraws the prompt with cursor-control and erase sequences, and a
+        # leftover \x1b[2K in front of ">>> " makes the returned prompt fail
+        # the line match below -- a finished turn then reads as PROCESSING
+        # forever. It also normalises carriage returns and cursor-to-column-1
+        # moves into newlines, which is what makes the per-line rule sound.
+        clean = strip_terminal_escapes(buffer)
 
         if re.search(ERROR_PATTERN, clean, re.MULTILINE | re.IGNORECASE):
             return TerminalStatus.ERROR
@@ -213,6 +220,11 @@ class OllamaCliProvider(BaseProvider):
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Text between the last two prompts, minus the echoed input line."""
+        # NOT strip_terminal_escapes here: it turns every cursor-to-column-1
+        # redraw into a newline, so a spinner that overwrites one line in the
+        # real terminal becomes one line per frame in the extracted answer.
+        # Extraction runs on rendered capture-pane output, where only colour
+        # sequences survive.
         clean = re.sub(ANSI_CODE_PATTERN, "", script_output)
         prompts = list(re.finditer(IDLE_PROMPT_ANY_PATTERN, clean, re.MULTILINE))
         if len(prompts) < 2:
