@@ -52,6 +52,24 @@ IDLE_PROMPT_HINT_PATTERN = r"^>>>\s+Send a message"
 IDLE_PROMPT_ANY_PATTERN = r"^>>>"
 IDLE_PROMPT_PATTERN_LOG = r">>>\s"
 
+# The prompt ollama draws when it hands control back. Captured from a live
+# session: it is always ">>> " followed by this hint, drawn with a cursor-back
+# move that strip_terminal_escapes removes. Requiring the hint -- rather than a
+# bare ">>> " -- is what stops the model forging a completion by emitting a
+# prompt-shaped line of its own. Anchored to the end of the buffer, and NOT to
+# the start of a line, because an interrupted turn leaves the prompt glued to
+# the partial answer ("...a vast and^C>>> Send a message (/? for help)").
+#
+# The tradeoff is deliberate: if a future ollama changes this hint, status
+# degrades to PROCESSING and the turn times out visibly, rather than to a forged
+# COMPLETED that silently delivers the wrong text. The raw fixtures pin the
+# string, so a change fails the suite.
+RETURNED_PROMPT_PATTERN = re.compile(r">>> Send a message \(/\? for help\)\s*$")
+
+# Ctrl-C during generation. Ollama echoes ^C at the point it stopped and then
+# redraws the prompt on the same line.
+INTERRUPTED_PATTERN = re.compile(r"\^C\s*$")
+
 # Multi-line paste mode: ollama echoes '"""' and waits for the closing quotes.
 # Treated as waiting-for-input rather than idle, because a task sent now would
 # be swallowed into the open string instead of running.
@@ -170,24 +188,21 @@ class OllamaCliProvider(BaseProvider):
         # forges COMPLETED mid-generation as soon as the model emits a line
         # starting with ">>>" -- a Python REPL transcript is enough, and small
         # local models produce those constantly.
-        lines = clean.splitlines()
-        last_index = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
-        if last_index is None:
-            return TerminalStatus.UNKNOWN
-
-        last_line = lines[last_index]
-        returned_to_prompt = bool(
-            re.match(IDLE_PROMPT_PATTERN, last_line)
-            or re.match(IDLE_PROMPT_HINT_PATTERN, last_line)
-        )
-        if not returned_to_prompt:
+        returned = RETURNED_PROMPT_PATTERN.search(clean)
+        if not returned:
             # Still pulling the model, or still streaming an answer. Reporting
             # IDLE here would advertise the terminal as free and let a second
             # task land on top of a running one.
             return TerminalStatus.PROCESSING
 
-        prompt_start = sum(len(line) + 1 for line in lines[:last_index])
-        head = clean[:prompt_start]
+        head = clean[: returned.start()]
+
+        # Ctrl-C prints a literal ^C where generation stopped and then redraws
+        # the prompt, so the buffer looks exactly like a finished turn. It is
+        # not one: the text before it is half an answer, and returning COMPLETED
+        # hands that partial to the caller as the final response.
+        if INTERRUPTED_PATTERN.search(head):
+            return TerminalStatus.IDLE
 
         # Text between the prompt that opened this turn and the one that closed
         # it is the answer. Ollama has no response marker, so this positional

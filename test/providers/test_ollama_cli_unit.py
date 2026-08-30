@@ -20,6 +20,11 @@ from cli_agent_orchestrator.services.settings_service import get_server_settings
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
+# What ollama actually draws when it hands control back, captured from a live
+# session. A bare ">>> " is what the model can forge, so it is not a
+# terminator; the tests use the real one.
+RETURNED = ">>> Send a message (/? for help)"
+
 
 def fixture(name: str) -> str:
     return (FIXTURES / name).read_text()
@@ -62,7 +67,7 @@ class TestStatusDetection:
         assert provider.get_status(out) == TerminalStatus.WAITING_USER_ANSWER
 
     def test_ansi_codes_do_not_break_detection(self, provider):
-        coloured = "\x1b[32m>>> \x1b[0mreply\n\x1b[1mPONG\x1b[0m\n>>> "
+        coloured = f"\x1b[32m>>> \x1b[0mreply\n\x1b[1mPONG\x1b[0m\n{RETURNED}"
         assert provider.get_status(coloured) == TerminalStatus.COMPLETED
 
     def test_raw_pty_capture_of_a_finished_turn_is_completed(self, provider):
@@ -75,6 +80,19 @@ class TestStatusDetection:
         assert provider.get_status(fixture("ollama_completed_raw.txt")) == (
             TerminalStatus.COMPLETED
         )
+
+    def test_prompt_shaped_model_output_is_not_a_returned_prompt(self, provider):
+        # Review's carried-over finding: the model's own output ends the stream
+        # on a line that is exactly ">>> ". A bare prompt is forgeable, so it is
+        # not a terminator -- only the hint ollama actually draws is.
+        assert provider.get_status(">>> show me an empty repl\n>>> ") == (TerminalStatus.PROCESSING)
+
+    def test_interrupted_generation_does_not_deliver_a_partial_answer(self, provider):
+        # Review's carried-over finding, now pinned to a real capture: Ctrl-C
+        # mid-generation prints ^C and redraws the prompt on the same line, so
+        # the buffer looks like a finished turn. COMPLETED here hands the caller
+        # half an essay as the final answer.
+        assert provider.get_status(fixture("ollama_interrupted_raw.txt")) == (TerminalStatus.IDLE)
 
     def test_raw_pty_capture_at_the_prompt_is_idle(self, provider):
         assert provider.get_status(fixture("ollama_idle_raw.txt")) == TerminalStatus.IDLE
@@ -93,7 +111,7 @@ class TestStatusDetection:
         # not just colour. An SGR-only strip left those bytes in front of ">>> "
         # so the returned prompt failed the line match and a finished turn read
         # as PROCESSING forever.
-        buffer = f">>> hello\nhi there\n{redraw}>>> "
+        buffer = f">>> hello\nhi there\n{redraw}{RETURNED}"
         assert provider.get_status(buffer) == TerminalStatus.COMPLETED
 
     def test_repl_transcript_in_an_answer_does_not_forge_completion(self, provider):
@@ -128,7 +146,7 @@ class TestStatusDetection:
         # at_rolling_capacity precaution; without it a big answer reports IDLE
         # and is never harvested.
         capacity = get_server_settings()["state_buffer_max"]
-        rolled = ("answer text " * (capacity // 12 + 1)) + "\n>>> "
+        rolled = ("answer text " * (capacity // 12 + 1)) + f"\n{RETURNED}"
         assert len(rolled) >= capacity
         assert provider.get_status(rolled) == TerminalStatus.COMPLETED
 
@@ -136,24 +154,22 @@ class TestStatusDetection:
         # At capacity but with nothing in it. Whitespace is not a completed
         # turn, and claiming one would hand the caller an empty message.
         capacity = get_server_settings()["state_buffer_max"]
-        assert provider.get_status("\n" * capacity + ">>> ") == TerminalStatus.IDLE
+        assert provider.get_status("\n" * capacity + RETURNED) == TerminalStatus.IDLE
 
     def test_headless_buffer_below_capacity_is_not_assumed_complete(self, provider):
         # Same shape, but the buffer never filled, so nothing was dropped and
         # there is no honest reason to claim a turn finished.
-        assert provider.get_status("stray text\n>>> ") == TerminalStatus.IDLE
+        assert provider.get_status(f"stray text\n{RETURNED}") == TerminalStatus.IDLE
 
     def test_a_redrawn_prompt_with_nothing_typed_stays_idle(self, provider):
         # The hint prompt then a bare redraw. Nothing was sent, so there is no
         # turn to complete.
-        assert provider.get_status(">>> Send a message (/? for help)\n>>> ") == (
-            TerminalStatus.IDLE
-        )
+        assert provider.get_status(f"{RETURNED}\n{RETURNED}") == TerminalStatus.IDLE
 
     def test_empty_answer_still_completes_the_turn(self, provider):
         # The model returned nothing, but the turn is over. IDLE here would
         # look like the task was never dispatched.
-        assert provider.get_status(">>> hi\n>>> ") == TerminalStatus.COMPLETED
+        assert provider.get_status(f">>> hi\n{RETURNED}") == TerminalStatus.COMPLETED
 
 
 class TestMessageExtraction:
