@@ -775,3 +775,462 @@ class TestBuildAssignDescription:
         args_pos = desc.index("Args:")
         returns_pos = desc.index("Returns:")
         assert args_pos < returns_pos
+
+
+class TestAssignProviderOverride:
+    """The explicit ``provider=`` override on assign (and its absence).
+
+    Three cases, because the third is the one that used to be invisible:
+    omitted inherits exactly as before, named is honored, and a bad name FAILS
+    instead of quietly producing a worker on the supervisor's provider.
+    """
+
+    # --- provider omitted: unchanged behavior -----------------------------
+
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_omitted_provider_passes_no_override(self, mock_create):
+        """No provider -> _create_terminal resolves as before (profile, then supervisor)."""
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        mock_create.return_value = ("worker-1", "kiro_cli")
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = _assign_impl("developer", "Do work")
+
+        assert result["success"] is True
+        _, kwargs = mock_create.call_args
+        assert kwargs["provider_override"] is None
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_omitted_provider_does_not_probe_provider_health(self, mock_create, mock_requests):
+        """Nothing new happens on the existing path -- no extra round-trip, no new failure mode."""
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        mock_create.return_value = ("worker-1", "kiro_cli")
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = _assign_impl("developer", "Do work")
+
+        assert result["success"] is True
+        probed = [call.args[0] for call in mock_requests.get.call_args_list if call.args]
+        assert not any("/agents/providers" in url for url in probed)
+
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_create_terminal_without_override_still_inherits(
+        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+    ):
+        """provider_override=None leaves the profile/supervisor resolution untouched."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            terminal_id, provider = _create_terminal("reviewer", "/repo", provider_override=None)
+
+        assert (terminal_id, provider) == ("worker-1", "claude_code")
+        mock_resolve_provider.assert_called_once_with("reviewer", fallback_provider="kiro_cli")
+
+    # --- provider named: that provider is used ----------------------------
+
+    @patch("cli_agent_orchestrator.mcp_server.server._validate_provider_override")
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_named_provider_is_forwarded_to_create_terminal(self, mock_create, mock_validate):
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        mock_validate.return_value = "codex"
+        mock_create.return_value = ("worker-1", "codex")
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = _assign_impl("reviewer", "Review it", provider="codex")
+
+        assert result["success"] is True
+        mock_validate.assert_called_once_with("codex")
+        _, kwargs = mock_create.call_args
+        assert kwargs["provider_override"] == "codex"
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._validate_provider_override")
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_success_reports_the_provider_the_worker_actually_runs_on(
+        self, mock_create, mock_validate, _nudge
+    ):
+        """The caller must be able to READ which provider it got, not assume it."""
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        mock_validate.return_value = "codex"
+        mock_create.return_value = ("worker-1", "codex")
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = _assign_impl("reviewer", "Review it", provider="codex")
+
+        assert result["provider"] == "codex"
+        assert "codex" in result["message"]
+
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_create_terminal_override_beats_profile_and_supervisor(
+        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+    ):
+        """The override wins over BOTH inheritance sources, and short-circuits them.
+
+        The profile resolves to claude_code and the supervisor is kiro_cli; the
+        POST must still carry codex, and resolve_provider must not even be
+        consulted -- there is no path back to an inherited provider.
+        """
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "codex"}
+        post_response.raise_for_status.return_value = None
+
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            terminal_id, provider = _create_terminal("reviewer", "/repo", provider_override="codex")
+
+        assert (terminal_id, provider) == ("worker-1", "codex")
+        mock_resolve_provider.assert_not_called()
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs["params"]["provider"] == "codex"
+
+    # --- provider unknown / unhealthy: loud failure ------------------------
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_unknown_provider_fails_and_creates_no_terminal(self, mock_create, mock_requests):
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = _assign_impl("reviewer", "Review it", provider="claude-code")
+
+        assert result["success"] is False
+        assert result["terminal_id"] is None
+        assert "Assignment failed" in result["message"]
+        assert "'claude-code'" in result["message"]
+        assert "Not falling back" in result["message"]
+        mock_create.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_uninstalled_provider_fails_and_creates_no_terminal(self, mock_create, mock_requests):
+        """Deferred init means a broken provider would otherwise never surface.
+
+        assign returns before provider.initialize() runs on the server, so an
+        uninstalled CLI shows up (if at all) as a worker that never wakes. The
+        health gate turns that into an immediate, readable failure.
+        """
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        health_response = MagicMock()
+        health_response.json.return_value = [
+            {"name": "codex", "binary": "codex", "installed": False}
+        ]
+        health_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = health_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = _assign_impl("reviewer", "Review it", provider="codex")
+
+        assert result["success"] is False
+        assert result["terminal_id"] is None
+        assert "not on PATH" in result["message"]
+        assert "Not falling back" in result["message"]
+        mock_create.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_bad_provider_is_rejected_even_without_a_cao_terminal_id(
+        self, mock_create, mock_requests
+    ):
+        """Argument validation is deterministic, not dependent on the environment."""
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        with patch.dict(os.environ, {}, clear=True):
+            result = _assign_impl("reviewer", "Review it", provider="nonesuch")
+
+        assert result["success"] is False
+        assert "'nonesuch'" in result["message"]
+        mock_create.assert_not_called()
+
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server.generate_session_name",
+        return_value="cao-new-session",
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="codex")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_new_session_branch_also_honors_the_override(
+        self, mock_requests, mock_resolve_provider, mock_generate_session_name
+    ):
+        """Covers the fourth and last site that applies the override.
+
+        The override is applied at four points -- ``_create_terminal``'s
+        existing-session and new-session branches, and
+        ``_resolve_handoff_provider``'s in-terminal and no-terminal branches.
+        Each mirrors a pre-existing ``resolve_provider`` call; this is the one a
+        future edit is most likely to miss, since assign fast-fails without
+        CAO_TERMINAL_ID and cannot reach it today.
+        """
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "grok_cli"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": ""}):
+            terminal_id, provider = _create_terminal("reviewer", provider_override="grok_cli")
+
+        assert (terminal_id, provider) == ("worker-1", "grok_cli")
+        mock_resolve_provider.assert_not_called()
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs["params"]["provider"] == "grok_cli"
+
+
+class TestAssignDescriptionDocumentsProvider:
+    """The description must state what the schema now actually supports."""
+
+    def test_provider_section_and_arg_always_present(self):
+        for enable_sender_id in (True, False):
+            for enable_workdir in (True, False):
+                desc = _build_assign_description(enable_sender_id, enable_workdir)
+                assert "## Provider" in desc
+                assert "provider: Optional explicit provider" in desc
+
+    def test_description_distinguishes_provider_from_model(self):
+        """The confusion this parameter exists to end: model != provider."""
+        desc = _build_assign_description(enable_sender_id=True, enable_workdir=True)
+        assert "provider selects WHICH CLI runs the worker" in desc
+        assert "does not change" in desc
+
+    def test_description_states_the_no_silent_fallback_rule(self):
+        desc = _build_assign_description(enable_sender_id=True, enable_workdir=True)
+        assert "never quietly downgraded" in desc or "never downgraded" in desc
+
+    def test_assign_signature_accepts_provider(self):
+        import inspect
+
+        from cli_agent_orchestrator.mcp_server.server import assign
+
+        assert "provider" in inspect.signature(assign).parameters
+
+
+class TestAssignProviderOverrideWithOtherParams:
+    """provider alongside the other new-terminal parameters.
+
+    provider and model are resolved in the same path, so the failure to rule
+    out is an ORDERING one: a model id landing on a terminal that ended up on a
+    different provider than the one the model was chosen for. model is an
+    opaque passthrough in CAO (``_validate_model_id`` checks length/charset
+    only, never provider compatibility), so the guarantee that matters is that
+    both travel on the SAME request as the provider that selects the CLI.
+    """
+
+    @patch("cli_agent_orchestrator.mcp_server.server._validate_provider_override")
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_provider_and_model_are_forwarded_together(self, mock_create, mock_validate):
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        mock_validate.return_value = "codex"
+        mock_create.return_value = ("worker-1", "codex")
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = _assign_impl("reviewer", "Review it", model="gpt-5-codex", provider="codex")
+
+        assert result["success"] is True
+        _, kwargs = mock_create.call_args
+        assert kwargs["provider_override"] == "codex"
+        assert kwargs["model"] == "gpt-5-codex"
+
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_model_lands_on_the_named_provider_not_the_supervisors(
+        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+    ):
+        """The ordering guarantee: one request carries BOTH the model and the
+        provider it was chosen for. Supervisor is kiro_cli and the profile
+        resolves to claude_code; the codex model must not reach either."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "codex"}
+        post_response.raise_for_status.return_value = None
+
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            _create_terminal("reviewer", "/repo", model="gpt-5-codex", provider_override="codex")
+
+        _, kwargs = mock_requests.post.call_args
+        params = kwargs["params"]
+        assert params["provider"] == "codex"
+        assert params["model"] == "gpt-5-codex"
+
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_engine_gate_follows_the_overridden_provider_not_the_supervisors(
+        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+    ):
+        """Same ordering class as model: ``engine`` is kiro-only, and the gate
+        must read the OVERRIDDEN provider. Supervisor is kiro_cli, so a gate
+        reading the supervisor would leak engine onto a codex terminal."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "codex"}
+        post_response.raise_for_status.return_value = None
+
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            _create_terminal("reviewer", "/repo", engine="v2", provider_override="codex")
+
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs["params"]["provider"] == "codex"
+        assert "engine" not in kwargs["params"]
+
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_overriding_to_kiro_cli_re_enables_the_engine_param(
+        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+    ):
+        """The gate follows the override in BOTH directions."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "claude_code",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "kiro_cli"}
+        post_response.raise_for_status.return_value = None
+
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            _create_terminal("reviewer", "/repo", engine="v2", provider_override="kiro_cli")
+
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs["params"]["provider"] == "kiro_cli"
+        assert kwargs["params"]["engine"] == "v2"
+
+    @patch("cli_agent_orchestrator.mcp_server.server._validate_provider_override")
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_provider_and_use_worktree_are_forwarded_together(self, mock_create, mock_validate):
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        mock_validate.return_value = "codex"
+        mock_create.return_value = ("worker-1", "codex")
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = _assign_impl("reviewer", "Review it", use_worktree=True, provider="codex")
+
+        assert result["success"] is True
+        _, kwargs = mock_create.call_args
+        assert kwargs["provider_override"] == "codex"
+        assert kwargs["use_worktree"] is True
+
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_provider_override_does_not_disturb_worktree_provisioning(
+        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+    ):
+        """Both are new-terminal params resolved in the same path; assert the
+        combination reaches the request intact."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "codex"}
+        post_response.raise_for_status.return_value = None
+
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            _create_terminal("reviewer", "/repo", use_worktree=True, provider_override="codex")
+
+        _, kwargs = mock_requests.post.call_args
+        params = kwargs["params"]
+        assert params["provider"] == "codex"
+        assert params["use_worktree"] == "true"

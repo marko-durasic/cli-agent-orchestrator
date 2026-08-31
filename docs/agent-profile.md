@@ -101,9 +101,15 @@ Provider selection depends on the operation:
    installation uses the profile value and then the default provider.
 2. `cao launch --provider` overrides the profile for the initial session;
    otherwise launch uses the profile value and then the default provider.
-3. For a worker created by an agent, a valid `provider` in the worker profile
-   overrides the parent's provider. If it is absent or invalid, the worker
-   inherits the parent provider.
+3. For a worker created by an agent, an explicit `provider` argument on the
+   `assign` or `handoff` MCP tool overrides everything below it. Otherwise a
+   valid `provider` in the worker profile overrides the parent's provider, and
+   if that is absent or invalid the worker inherits the parent provider. An
+   explicit `provider` naming an unknown provider, or one whose CLI is not
+   installed on the host, fails the call rather than falling back to the
+   parent's provider — so profiles stay role-named and a caller can always tell
+   which provider it actually got. This argument selects the CLI; `model`
+   selects a model within whichever provider was resolved.
 
 The CLI help and provider resolver are the authoritative sources for this
 precedence. Provider-specific launch flags and behavior belong in the focused

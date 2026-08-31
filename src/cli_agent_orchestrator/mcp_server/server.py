@@ -15,6 +15,7 @@ from cli_agent_orchestrator.constants import (
     API_BASE_URL,
     DEFAULT_PROVIDER,
     DISCOVERY_TOOL_MARKER,
+    PROVIDERS,
     WORKFLOW_EVENTS_CONNECT_TIMEOUT,
     WORKFLOW_EVENTS_MCP_MAX_EVENTS,
     WORKFLOW_EVENTS_MCP_MAX_SECONDS,
@@ -177,6 +178,87 @@ def _resolve_child_allowed_tools(
     return ",".join(child_allowed)
 
 
+class ProviderOverrideError(ValueError):
+    """An explicit ``provider=`` override could not be honored.
+
+    Deliberately an error rather than a fallback. The whole value of the
+    override is that a caller can tell "I got the provider I asked for" apart
+    from "I got the supervisor's provider"; silently substituting the default
+    destroys that distinction and makes a fleet look cross-provider when every
+    worker is really the same one.
+    """
+
+
+def _provider_health_error(provider: str) -> Optional[str]:
+    """Return a failure reason when ``provider`` is not usable on this host.
+
+    Health comes from ``GET /agents/providers``, which reports each provider's
+    expected CLI binary and whether it is on PATH. Two deliberate non-failures:
+
+    - A provider the endpoint does not list (``mock_cli`` has no binary by
+      design) is NOT called unhealthy -- absence of evidence is not evidence.
+    - If the endpoint itself is unreachable we skip the gate rather than guess.
+      The override still stands and the request still goes out under the
+      requested provider, so any real problem surfaces server-side as a failed
+      terminal -- never as a quiet substitution of the supervisor's provider.
+    """
+    try:
+        response = requests.get(f"{API_BASE_URL}/agents/providers", timeout=_mcp_timeout())
+        response.raise_for_status()
+        entries = response.json()
+        # Parse inside the try as well: a malformed body must degrade to
+        # "unknown health" like an unreachable server, not raise out of a
+        # tool call.
+        entry = next(
+            (e for e in entries if isinstance(e, dict) and e.get("name") == provider),
+            None,
+        )
+    except Exception as exc:  # noqa: BLE001 - health is advisory, see docstring
+        logger.warning("Could not check provider health for %r: %s", provider, exc)
+        return None
+
+    if entry is None or entry.get("installed"):
+        return None
+    binary = entry.get("binary") or provider
+    return (
+        f"Provider {provider!r} is not usable on this host: its CLI binary "
+        f"{binary!r} is not on PATH. Not falling back to the supervisor's "
+        "provider -- install the CLI, name a different provider, or omit "
+        "the provider parameter to inherit."
+    )
+
+
+def _validate_provider_override(provider: Optional[str]) -> Optional[str]:
+    """Validate an explicit provider override; ``None`` means "not overridden".
+
+    Omitted (``None``, or blank/whitespace) returns ``None`` and the caller
+    keeps the historical behavior exactly: ``resolve_provider`` picks the agent
+    profile's own ``provider`` key, falling back to the supervisor's provider.
+
+    A NAMED provider is either honored or raises. An unknown name or an
+    uninstalled CLI both fail loudly here, before any terminal is created.
+
+    Raises:
+        ProviderOverrideError: The named provider is unknown or unhealthy.
+    """
+    if provider is None:
+        return None
+    normalized = provider.strip()
+    if not normalized:
+        return None
+    if normalized not in PROVIDERS:
+        raise ProviderOverrideError(
+            f"Unknown provider {provider!r}. Valid providers: "
+            f"{', '.join(sorted(PROVIDERS))}. Not falling back to the "
+            "supervisor's provider -- re-issue with a valid provider, or omit "
+            "the provider parameter to inherit."
+        )
+    unhealthy = _provider_health_error(normalized)
+    if unhealthy:
+        raise ProviderOverrideError(unhealthy)
+    return normalized
+
+
 def _create_terminal(
     agent_profile: str,
     working_directory: Optional[str] = None,
@@ -186,6 +268,7 @@ def _create_terminal(
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    provider_override: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -215,6 +298,12 @@ def _create_terminal(
             ``working_directory`` as given. Only meaningful on the
             existing-session (assign) branch below -- the new-session branch
             has no live caller today.
+        provider_override: An already-validated explicit provider (see
+            ``_validate_provider_override``). When set it wins outright over
+            both the agent profile's ``provider`` key and the supervisor's
+            provider -- the caller asked for this provider by name, so it is
+            used or nothing is. ``None`` keeps the inherit-from-profile-then-
+            supervisor resolution unchanged.
 
     Returns:
         Tuple of (terminal_id, provider)
@@ -236,7 +325,11 @@ def _create_terminal(
         terminal_metadata = response.json()
 
         # Treat the supervisor provider as a fallback, not an explicit override.
-        provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+        # An explicit provider_override outranks both: it is the caller naming a
+        # provider, which resolve_provider has no way to express.
+        provider = provider_override or resolve_provider(
+            agent_profile, fallback_provider=terminal_metadata["provider"]
+        )
         session_name = terminal_metadata["session_name"]
         parent_allowed_tools = terminal_metadata.get("allowed_tools")
 
@@ -314,7 +407,7 @@ def _create_terminal(
                 "(no current CAO_TERMINAL_ID)"
             )
         session_name = generate_session_name()
-        provider = resolve_provider(agent_profile, fallback_provider=provider)
+        provider = provider_override or resolve_provider(agent_profile, fallback_provider=provider)
         params = {
             "provider": provider,
             "agent_profile": agent_profile,
@@ -569,7 +662,9 @@ class HandoffContext(NamedTuple):
     allowed_tools: Optional[list]
 
 
-def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
+def _resolve_handoff_provider(
+    agent_profile: str, provider_override: Optional[str] = None
+) -> HandoffContext:
     """Resolve the handoff context for a worker WITHOUT creating a terminal.
 
     Mirrors the resolution branch of the former ``_create_terminal``: a worker
@@ -579,6 +674,12 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     profile. When NOT run inside a CAO terminal there is no supervisor: a fresh
     session is auto-created (``session_name=None``) and no caller is recorded.
 
+    ``provider_override`` is an already-validated explicit provider (see
+    ``_validate_provider_override``). It outranks the profile's ``provider`` key
+    AND the supervisor's provider on both branches -- naming a provider is the
+    one thing the inheritance chain cannot otherwise express. Leaving it ``None``
+    reproduces the previous resolution byte for byte.
+
     This lets the codex fast-fail and codex prompt-shaping run caller-side before
     the single combined run-step call, while preserving the same-session /
     caller_id / allowed_tools behavior the old six-call path had.
@@ -586,7 +687,8 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     current_terminal_id = _current_terminal_id()
     if not current_terminal_id:
         return HandoffContext(
-            provider=resolve_provider(agent_profile, fallback_provider=DEFAULT_PROVIDER),
+            provider=provider_override
+            or resolve_provider(agent_profile, fallback_provider=DEFAULT_PROVIDER),
             session_name=None,
             caller_id=None,
             allowed_tools=None,
@@ -598,7 +700,9 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     response.raise_for_status()
     terminal_metadata = response.json()
 
-    provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+    provider = provider_override or resolve_provider(
+        agent_profile, fallback_provider=terminal_metadata["provider"]
+    )
     # Resolve the child's allowed-tools via the same inheritance the old path
     # used; _resolve_child_allowed_tools returns a comma-separated string (or
     # None for unrestricted), which we split into the list the payload expects.
@@ -724,6 +828,7 @@ async def _handoff_impl(
     engine: Optional[str] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    provider: Optional[str] = None,
 ) -> HandoffResult:
     """Implementation of handoff logic.
 
@@ -736,6 +841,11 @@ async def _handoff_impl(
     HandoffResult shape + success/failure semantics, same codex CAO_TERMINAL_ID
     fast-fail, same timeout contract, terminal auto-torn-down on success.
 
+    ``provider`` is the optional explicit provider override. Omitted, resolution
+    is exactly as before (profile's provider key, else the supervisor's). Named,
+    it is validated up front and then used verbatim -- an unknown or uninstalled
+    provider fails here rather than quietly becoming the supervisor's provider.
+
     Codex prompt-shaping (the [CAO Handoff] banner) stays CALLER-SIDE here: it
     depends on this MCP process's ``CAO_TERMINAL_ID`` env var, which the server
     process does not have. We shape the prompt before the single call and pass
@@ -746,6 +856,19 @@ async def _handoff_impl(
     start_time = time.time()
     terminal_id: Optional[str] = None
 
+    # Validate the explicit provider BEFORE anything else. A bad override must
+    # never reach terminal creation, and must never degrade into the
+    # supervisor's provider -- the caller has to be able to tell the two apart.
+    try:
+        provider_override = _validate_provider_override(provider)
+    except ProviderOverrideError as exc:
+        return HandoffResult(
+            success=False,
+            message=f"Handoff failed: {exc}",
+            output=None,
+            terminal_id=None,
+        )
+
     try:
         # Resolve the supervisor context WITHOUT creating a terminal, so the
         # codex fast-fail (which needs CAO_TERMINAL_ID) and the codex
@@ -755,12 +878,12 @@ async def _handoff_impl(
         # in the SAME session with #284 callback routing and tool inheritance
         # preserved (BR-8 observable-behavior parity). The endpoint then
         # creates + drives + tears down the terminal.
-        ctx = _resolve_handoff_provider(agent_profile)
-        provider = ctx.provider
+        ctx = _resolve_handoff_provider(agent_profile, provider_override=provider_override)
+        resolved_provider = ctx.provider
 
         # Fail fast for codex: its handoff banner requires CAO_TERMINAL_ID. We
         # check before any terminal is created (no terminal_id to surface yet).
-        if provider == "codex" and not _current_terminal_id():
+        if resolved_provider == "codex" and not _current_terminal_id():
             return HandoffResult(
                 success=False,
                 message=(
@@ -774,14 +897,14 @@ async def _handoff_impl(
 
         # Shape the prompt caller-side (prepends the codex [CAO Handoff] banner
         # when provider == codex; otherwise returns the message unchanged).
-        shaped_message = _shape_handoff_message(provider, message)
+        shaped_message = _shape_handoff_message(resolved_provider, message)
 
         # Single combined call: create -> ready-wait -> input -> complete-wait ->
         # extract -> teardown, all server-side via run_agent_step. session_name
         # places the worker in the supervisor's session; caller_id/allowed_tools
         # preserve #284 callback routing and tool inheritance.
         payload: Dict[str, Any] = {
-            "provider": provider,
+            "provider": resolved_provider,
             "agent": agent_profile,
             "prompt": shaped_message,
             "teardown": True,
@@ -796,7 +919,7 @@ async def _handoff_impl(
             payload["allowed_tools"] = ctx.allowed_tools
         if working_directory:
             payload["working_directory"] = working_directory
-        if provider == ProviderType.KIRO_CLI.value and engine is not None:
+        if resolved_provider == ProviderType.KIRO_CLI.value and engine is not None:
             payload["engine"] = engine
         if model and model.strip():
             payload["model"] = model
@@ -853,7 +976,7 @@ async def _handoff_impl(
         execution_time = time.time() - start_time
         return HandoffResult(
             success=True,
-            message=f"Successfully handed off to {agent_profile} ({provider}) in {execution_time:.2f}s"
+            message=f"Successfully handed off to {agent_profile} ({resolved_provider}) in {execution_time:.2f}s"
             + _get_cleanup_nudge(),
             output=output,
             terminal_id=terminal_id,
@@ -876,6 +999,20 @@ _model_field_desc = (
     "no dedicated profile is needed just to pin a specific model. Not honored by "
     "every provider (see the target provider's own docs); omit to use the agent "
     "profile's configured model as before."
+)
+
+# Shared by both handoff and assign's tool signatures below.
+_provider_field_desc = (
+    "Optional CLI provider for the worker (e.g. 'claude_code', 'codex', "
+    "'cursor_cli', 'grok_cli'). This selects WHICH AGENT CLI is launched, and is "
+    "not the same thing as `model`, which only picks a model within whichever "
+    "provider was resolved. Omit to keep the existing behaviour: the agent "
+    "profile's own `provider` key if it has one, otherwise the provider of the "
+    "terminal you are calling from -- which is why workers otherwise always come "
+    "back on your own provider. Name a provider to run this worker on a "
+    "different CLI (e.g. to get a genuinely independent second opinion). An "
+    "unknown provider, or one whose CLI is not installed on this host, FAILS the "
+    "call -- it is never quietly downgraded to your provider."
 )
 
 
@@ -902,6 +1039,7 @@ if ENABLE_WORKING_DIRECTORY:
             default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        provider: Optional[str] = Field(default=None, description=_provider_field_desc),
         use_worktree: bool = Field(
             default=False,
             description=(
@@ -926,6 +1064,7 @@ if ENABLE_WORKING_DIRECTORY:
         Use this tool to hand off tasks to another agent and wait for the results.
         The tool will:
         1. Create a new terminal with the specified agent profile and provider
+           (provider defaults to the profile's own, else this terminal's)
         2. Set the working directory for the terminal (defaults to supervisor's cwd)
         3. Send the message to the terminal
         4. Monitor until completion
@@ -937,6 +1076,20 @@ if ENABLE_WORKING_DIRECTORY:
         - By default, agents start in the supervisor's current working directory
         - You can specify a custom directory via working_directory parameter
         - Directory must exist and be accessible
+
+        ## Provider
+
+        - provider selects WHICH CLI runs the worker; model only selects a model
+          WITHIN the provider that was resolved. Passing another provider's model
+          id does not change the provider.
+        - Omitted, the worker uses the agent profile's own `provider` key if it
+          has one, and otherwise inherits the provider of the calling terminal --
+          so by default every worker you create runs on your own provider.
+        - Name a provider to override both (e.g. handoff to a reviewer on `codex`
+          from a `claude_code` supervisor for an independent second opinion).
+        - An unknown provider, or one whose CLI is not installed on this host,
+          fails the handoff. It is never downgraded to your provider, so a
+          success always means you got the provider you asked for.
 
         ## Model
 
@@ -970,6 +1123,7 @@ if ENABLE_WORKING_DIRECTORY:
             timeout: Maximum wait time in seconds
             working_directory: Optional directory path where agent should execute
             model: Optional model override (not honored by every provider)
+            provider: Optional explicit provider for the worker; omit to inherit
             use_worktree: If true, isolate this handoff in its own git worktree
 
         Returns:
@@ -983,6 +1137,7 @@ if ENABLE_WORKING_DIRECTORY:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            provider=provider,
         )
 
 else:
@@ -1003,6 +1158,7 @@ else:
             default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        provider: Optional[str] = Field(default=None, description=_provider_field_desc),
         use_worktree: bool = Field(
             default=False,
             description=(
@@ -1026,10 +1182,25 @@ else:
         Use this tool to hand off tasks to another agent and wait for the results.
         The tool will:
         1. Create a new terminal with the specified agent profile and provider
+           (provider defaults to the profile's own, else this terminal's)
         2. Send the message to the terminal (starts in supervisor's current directory)
         3. Monitor until completion
         4. Return the agent's response
         5. Clean up the terminal with /exit
+
+        ## Provider
+
+        - provider selects WHICH CLI runs the worker; model only selects a model
+          WITHIN the provider that was resolved. Passing another provider's model
+          id does not change the provider.
+        - Omitted, the worker uses the agent profile's own `provider` key if it
+          has one, and otherwise inherits the provider of the calling terminal --
+          so by default every worker you create runs on your own provider.
+        - Name a provider to override both (e.g. handoff to a reviewer on `codex`
+          from a `claude_code` supervisor for an independent second opinion).
+        - An unknown provider, or one whose CLI is not installed on this host,
+          fails the handoff. It is never downgraded to your provider, so a
+          success always means you got the provider you asked for.
 
         ## Model
 
@@ -1058,6 +1229,7 @@ else:
             message: The task/message to send
             timeout: Maximum wait time in seconds
             model: Optional model override (not honored by every provider)
+            provider: Optional explicit provider for the worker; omit to inherit
             use_worktree: If true, isolate this handoff in its own git worktree
 
         Returns:
@@ -1071,6 +1243,7 @@ else:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            provider=provider,
         )
 
 
@@ -1082,6 +1255,7 @@ def _assign_impl(
     engine: Optional[str] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1092,8 +1266,29 @@ def _assign_impl(
     under kiro-cli 2.11's ~60s per-tool client timeout, and lets multiple
     concurrent assigns from the same LLM turn run their init phases in
     parallel instead of blocking one behind the other.
+
+    ``provider`` is the optional explicit provider override. Omitted, the worker
+    resolves its provider exactly as before (profile's ``provider`` key, else
+    inherited from the supervisor). Named, it is validated before any terminal
+    is created and then used verbatim; an unknown or uninstalled provider is a
+    hard failure, never a silent downgrade to the supervisor's provider. This
+    matters more on assign than on handoff because assign uses deferred init --
+    the server returns before ``provider.initialize()`` runs, so a bad provider
+    would otherwise surface (if at all) as a worker that never wakes up.
     """
     terminal_id: Optional[str] = None
+
+    # Validate the override first: pure argument checking, no terminal needed,
+    # and a deterministic error regardless of the caller's environment.
+    try:
+        provider_override = _validate_provider_override(provider)
+    except ProviderOverrideError as exc:
+        return {
+            "success": False,
+            "terminal_id": None,
+            "message": f"Assignment failed: {exc}",
+        }
+
     try:
         # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
         # unset — REGARDLESS of the sender-ID-injection flag. The deferred-init
@@ -1134,7 +1329,7 @@ def _assign_impl(
         # provider.initialize() and initial-message delivery run as a
         # background task on the server. The tool-call typically returns
         # in under 2 seconds regardless of how long init takes.
-        terminal_id, _ = _create_terminal(
+        terminal_id, resolved_provider = _create_terminal(
             agent_profile,
             working_directory,
             engine=engine,
@@ -1143,13 +1338,16 @@ def _assign_impl(
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
             model=model,
             use_worktree=use_worktree,
+            provider_override=provider_override,
         )
 
         return {
             "success": True,
             "terminal_id": terminal_id,
+            "provider": resolved_provider,
             "message": (
-                f"Task assigned to {agent_profile} (terminal: {terminal_id}). "
+                f"Task assigned to {agent_profile} on provider {resolved_provider} "
+                f"(terminal: {terminal_id}). "
                 f"Worker is initializing in the background; your task will be "
                 f"delivered once it is ready. "
                 f"Call delete_terminal('{terminal_id}') when you no longer need this terminal."
@@ -1198,6 +1396,22 @@ Example message: "Analyze the logs. When done, send results back to terminal ee3
 
     desc += """
 
+## Provider
+
+- provider selects WHICH CLI runs the worker; model only selects a model WITHIN the
+  provider that was resolved. Passing another provider's model id does not change
+  the provider.
+- Omitted, the worker uses its agent profile's own `provider` key if it has one, and
+  otherwise inherits the provider of the calling terminal -- so by default every
+  worker you assign runs on your own provider.
+- Name a provider to override both (e.g. assign a reviewer on `codex` from a
+  `claude_code` supervisor for an independent second opinion). Profiles stay
+  role-named; you do not need a per-provider profile.
+- An unknown provider, or one whose CLI is not installed on this host, fails the
+  assign. It is never downgraded to your provider, so a success always means you
+  got the provider you asked for. The returned `provider` field reports what the
+  worker actually runs on.
+
 ## Model
 
 - By default, the worker uses whatever model its agent profile is configured with
@@ -1230,10 +1444,12 @@ Args:
 
     desc += """
     model: Optional model override for the worker (not honored by every provider)
+    provider: Optional explicit provider for the worker; omit to inherit
     use_worktree: If true, isolate this worker in its own git worktree
 
 Returns:
-    Dict with success status, worker terminal_id, and message"""
+    Dict with success status, worker terminal_id, the provider the worker
+    actually runs on, and message"""
 
     return desc
 
@@ -1262,6 +1478,7 @@ if ENABLE_WORKING_DIRECTORY:
             default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        provider: Optional[str] = Field(default=None, description=_provider_field_desc),
         use_worktree: bool = Field(
             default=False,
             description=(
@@ -1281,6 +1498,7 @@ if ENABLE_WORKING_DIRECTORY:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            provider=provider,
         )
 
 else:
@@ -1295,6 +1513,7 @@ else:
             default=None, description="Explicit Kiro engine for the worker (v2 or kas)"
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        provider: Optional[str] = Field(default=None, description=_provider_field_desc),
         use_worktree: bool = Field(
             default=False,
             description=(
@@ -1314,6 +1533,7 @@ else:
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            provider=provider,
         )
 
 
