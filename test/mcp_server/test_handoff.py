@@ -493,3 +493,303 @@ class TestResolveHandoffProvider:
         assert ctx.session_name is None
         assert ctx.caller_id is None
         assert ctx.allowed_tools is None
+
+
+class TestHandoffProviderOverride:
+    """The explicit ``provider=`` override on handoff (and its absence).
+
+    handoff's own description already claimed it would "Create a new terminal
+    with the specified agent profile and provider" while its schema accepted no
+    provider argument -- the tool documented a capability it did not expose.
+    These tests pin the capability now that it exists: omitted inherits, named
+    is honored, bad name fails loudly.
+    """
+
+    # --- provider omitted: unchanged behavior -----------------------------
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_omitted_provider_passes_no_override(self, mock_requests, mock_provider, _nudge):
+        mock_provider.return_value = _ctx("claude_code")
+        mock_requests.post.return_value = _ok_run_step_response()
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = asyncio.run(_handoff_impl("developer", "Do work"))
+
+        assert result.success is True
+        mock_provider.assert_called_once_with("developer", provider_override=None)
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs["json"]["provider"] == "claude_code"
+
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_resolve_context_without_override_still_inherits(
+        self, mock_requests, mock_resolve_provider
+    ):
+        """provider_override=None leaves the profile/supervisor resolution untouched."""
+        from cli_agent_orchestrator.mcp_server.server import _resolve_handoff_provider
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = metadata_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            ctx = _resolve_handoff_provider("reviewer")
+
+        assert ctx.provider == "claude_code"
+        mock_resolve_provider.assert_called_once_with("reviewer", fallback_provider="kiro_cli")
+
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="kiro_cli")
+    def test_resolve_context_without_terminal_and_without_override_is_unchanged(
+        self, mock_resolve_provider
+    ):
+        """Outside a CAO terminal the DEFAULT_PROVIDER fallback still applies."""
+        from cli_agent_orchestrator.mcp_server.server import _resolve_handoff_provider
+
+        with patch.dict(os.environ, {}, clear=True):
+            ctx = _resolve_handoff_provider("reviewer")
+
+        assert ctx.provider == "kiro_cli"
+        assert ctx.session_name is None and ctx.caller_id is None
+
+    # --- provider named: that provider is used ----------------------------
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._validate_provider_override")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_named_provider_reaches_the_run_step_payload(
+        self, mock_requests, mock_provider, mock_validate, _nudge
+    ):
+        mock_validate.return_value = "codex"
+        mock_provider.return_value = _ctx("codex", caller_id="a1b2c3d4")
+        mock_requests.post.return_value = _ok_run_step_response()
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = asyncio.run(_handoff_impl("reviewer", "Review it", provider="codex"))
+
+        assert result.success is True
+        mock_validate.assert_called_once_with("codex")
+        mock_provider.assert_called_once_with("reviewer", provider_override="codex")
+        _, kwargs = mock_requests.post.call_args
+        assert kwargs["json"]["provider"] == "codex"
+        # The named provider also drives provider-specific shaping: asking for
+        # codex must produce the codex banner, not the supervisor's plain prompt.
+        assert kwargs["json"]["prompt"].startswith("[CAO Handoff]")
+        assert "codex" in result.message
+
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_resolve_context_override_beats_profile_and_supervisor(
+        self, mock_requests, mock_resolve_provider
+    ):
+        """The override wins over BOTH inheritance sources, and short-circuits them."""
+        from cli_agent_orchestrator.mcp_server.server import _resolve_handoff_provider
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = metadata_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            ctx = _resolve_handoff_provider("reviewer", provider_override="grok_cli")
+
+        assert ctx.provider == "grok_cli"
+        assert ctx.session_name == "cao-session"  # still the supervisor's session
+        assert ctx.caller_id == "a1b2c3d4"  # still #284 callback routing
+        mock_resolve_provider.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="kiro_cli")
+    def test_resolve_context_override_applies_outside_a_cao_terminal(self, mock_resolve_provider):
+        from cli_agent_orchestrator.mcp_server.server import _resolve_handoff_provider
+
+        with patch.dict(os.environ, {}, clear=True):
+            ctx = _resolve_handoff_provider("reviewer", provider_override="grok_cli")
+
+        assert ctx.provider == "grok_cli"
+        mock_resolve_provider.assert_not_called()
+
+    # --- provider unknown / unhealthy: loud failure ------------------------
+
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_unknown_provider_fails_before_resolving_anything(self, mock_requests, mock_provider):
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = asyncio.run(_handoff_impl("reviewer", "Review it", provider="claude-code"))
+
+        assert result.success is False
+        assert result.terminal_id is None
+        assert "Handoff failed" in result.message
+        assert "'claude-code'" in result.message
+        assert "Not falling back" in result.message
+        mock_provider.assert_not_called()
+        mock_requests.post.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_uninstalled_provider_fails_before_resolving_anything(
+        self, mock_requests, mock_provider
+    ):
+        health_response = MagicMock()
+        health_response.json.return_value = [
+            {"name": "grok_cli", "binary": "grok", "installed": False}
+        ]
+        health_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = health_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = asyncio.run(_handoff_impl("reviewer", "Review it", provider="grok_cli"))
+
+        assert result.success is False
+        assert result.terminal_id is None
+        assert "'grok'" in result.message  # names the missing binary
+        assert "Not falling back" in result.message
+        mock_provider.assert_not_called()
+        mock_requests.post.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_bad_provider_is_rejected_even_without_a_cao_terminal_id(
+        self, mock_requests, mock_provider
+    ):
+        """Rejected as a bad argument, not conflated with the codex fast-fail."""
+        with patch.dict(os.environ, {}, clear=True):
+            result = asyncio.run(_handoff_impl("reviewer", "Review it", provider="nonesuch"))
+
+        assert result.success is False
+        assert "'nonesuch'" in result.message
+        assert "CAO_TERMINAL_ID" not in result.message
+        mock_provider.assert_not_called()
+
+
+class TestHandoffDocstringMatchesSchema:
+    """The documentation defect: handoff promised a provider it did not accept."""
+
+    def test_handoff_signature_accepts_provider(self):
+        import inspect
+
+        from cli_agent_orchestrator.mcp_server.server import handoff
+
+        assert "provider" in inspect.signature(handoff).parameters
+
+    def test_handoff_docstring_documents_the_provider_parameter(self):
+        from cli_agent_orchestrator.mcp_server.server import handoff
+
+        doc = handoff.__doc__ or ""
+        assert "## Provider" in doc
+        assert "provider: Optional explicit provider" in doc
+
+    def test_handoff_docstring_distinguishes_provider_from_model(self):
+        from cli_agent_orchestrator.mcp_server.server import handoff
+
+        doc = handoff.__doc__ or ""
+        assert "provider selects WHICH CLI runs the worker" in doc
+
+
+class TestHandoffProviderOverrideWithOtherParams:
+    """provider alongside the other worker parameters on the handoff path.
+
+    Same ordering concern as assign: model is an opaque passthrough (CAO never
+    checks a model id against a provider), so what must hold is that model,
+    engine and use_worktree all ride the SAME run-step payload as the provider
+    that selects the CLI.
+    """
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._validate_provider_override")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_model_rides_the_same_payload_as_the_named_provider(
+        self, mock_requests, mock_provider, mock_validate, _nudge
+    ):
+        mock_validate.return_value = "codex"
+        mock_provider.return_value = _ctx("codex", caller_id="a1b2c3d4")
+        mock_requests.post.return_value = _ok_run_step_response()
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = asyncio.run(
+                _handoff_impl("reviewer", "Review it", model="gpt-5-codex", provider="codex")
+            )
+
+        assert result.success is True
+        _, kwargs = mock_requests.post.call_args
+        payload = kwargs["json"]
+        assert payload["provider"] == "codex"
+        assert payload["model"] == "gpt-5-codex"
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._validate_provider_override")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_engine_gate_follows_the_overridden_provider(
+        self, mock_requests, mock_provider, mock_validate, _nudge
+    ):
+        """engine is kiro-only; overriding to codex must drop it."""
+        mock_validate.return_value = "codex"
+        mock_provider.return_value = _ctx("codex", caller_id="a1b2c3d4")
+        mock_requests.post.return_value = _ok_run_step_response()
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = asyncio.run(
+                _handoff_impl("reviewer", "Review it", engine="v2", provider="codex")
+            )
+
+        assert result.success is True
+        _, kwargs = mock_requests.post.call_args
+        payload = kwargs["json"]
+        assert payload["provider"] == "codex"
+        assert "engine" not in payload
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._validate_provider_override")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_overriding_to_kiro_cli_re_enables_the_engine_field(
+        self, mock_requests, mock_provider, mock_validate, _nudge
+    ):
+        mock_validate.return_value = "kiro_cli"
+        mock_provider.return_value = _ctx("kiro_cli", caller_id="a1b2c3d4")
+        mock_requests.post.return_value = _ok_run_step_response()
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = asyncio.run(
+                _handoff_impl("reviewer", "Review it", engine="v2", provider="kiro_cli")
+            )
+
+        assert result.success is True
+        _, kwargs = mock_requests.post.call_args
+        payload = kwargs["json"]
+        assert payload["provider"] == "kiro_cli"
+        assert payload["engine"] == "v2"
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._validate_provider_override")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_use_worktree_rides_the_same_payload_as_the_named_provider(
+        self, mock_requests, mock_provider, mock_validate, _nudge
+    ):
+        mock_validate.return_value = "codex"
+        mock_provider.return_value = _ctx("codex", caller_id="a1b2c3d4")
+        mock_requests.post.return_value = _ok_run_step_response()
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            result = asyncio.run(
+                _handoff_impl("reviewer", "Review it", use_worktree=True, provider="codex")
+            )
+
+        assert result.success is True
+        _, kwargs = mock_requests.post.call_args
+        payload = kwargs["json"]
+        assert payload["provider"] == "codex"
+        assert payload["use_worktree"] is True
