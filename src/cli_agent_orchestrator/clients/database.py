@@ -22,6 +22,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
+from sqlalchemy.types import TypeDecorator
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
@@ -30,6 +31,48 @@ from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 logger = logging.getLogger(__name__)
 
 Base: Any = declarative_base()
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    """Return ``value`` as an AWARE UTC datetime; a naive value is taken as UTC.
+
+    ``last_active`` and inbox ``created_at`` used to be stamped with a naive
+    ``datetime.now()`` -- server-local wall time with nothing in the value to
+    say which zone. Clients had to guess, and guessed differently: the web UI
+    parsed it as browser-local, other readers as UTC. Rows written since the
+    switch to ``_utcnow`` are UTC, and SQLite hands every row back naive, so
+    naive means UTC here. Rows written by an older server running in a non-UTC
+    zone are off by that zone's offset; ``last_active`` heals on the next
+    input, inbox ``created_at`` only feeds retention.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+class UTCDateTime(TypeDecorator):
+    """A ``DateTime`` stored as naive UTC and read back as AWARE UTC.
+
+    Storage is unchanged (SQLite keeps no offset either way), so no migration:
+    the difference is that a value cannot leave the database naive, and a bound
+    comparison value is converted to UTC before SQLite compares the strings.
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: Optional[datetime], dialect: Any) -> Optional[datetime]:
+        utc = as_utc(value)
+        return None if utc is None else utc.replace(tzinfo=None)
+
+    def process_result_value(self, value: Optional[datetime], dialect: Any) -> Optional[datetime]:
+        return as_utc(value)
 
 
 class TerminalModel(Base):
@@ -57,7 +100,7 @@ class TerminalModel(Base):
     # MetaData object on every mapped class; the DB column itself is still
     # literally named "metadata" per #432's design.
     metadata_json = Column("metadata", Text, nullable=True)
-    last_active = Column(DateTime, default=datetime.now)
+    last_active = Column(UTCDateTime, default=_utcnow)
 
     # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
     # and ``list_terminals_in_sessions`` -- order by SQLite's implicit ``rowid``,
@@ -123,11 +166,7 @@ class InboxModel(Base):
     receiver_id = Column(String, nullable=False)
     message = Column(String, nullable=False)
     status = Column(String, nullable=False)  # MessageStatus enum value
-    created_at = Column(DateTime, default=datetime.now)
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    created_at = Column(UTCDateTime, default=_utcnow)
 
 
 class MemoryMetadataModel(Base):
@@ -379,7 +418,7 @@ class IdempotencyKeyModel(Base):
     # from an earlier revision of this branch, whose fix is deleting the file.
     # It is compared like any other value and simply mismatches, loudly.
     request_fingerprint = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(UTCDateTime, default=_utcnow)
 
 
 def _ensure_db_dir() -> None:
@@ -1776,7 +1815,7 @@ def update_last_active(terminal_id: str) -> bool:
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal:
-            terminal.last_active = datetime.now()
+            terminal.last_active = _utcnow()
             db.commit()
             return True
         return False
@@ -1897,11 +1936,12 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
     The join on ``terminals`` drops messages whose receiver terminal no longer
     exists, so the sweep does not keep retrying deliveries to deleted agents.
 
-    ``created_at`` is stored local-naive (``InboxModel.created_at`` defaults to
-    ``datetime.now``), so the cutoff uses ``datetime.now()`` to match — the same
-    convention as the retention query in ``cleanup_service.cleanup_old_data``.
+    ``created_at`` is UTC (``UTCDateTime``, defaulting to ``_utcnow``), so the
+    cutoff is UTC too -- the same convention as the retention query in
+    ``cleanup_service.cleanup_old_data``. The two must move together: a local
+    cutoff against UTC rows shifts the age by the server's offset.
     """
-    cutoff = datetime.now() - timedelta(seconds=min_age_seconds)
+    cutoff = _utcnow() - timedelta(seconds=min_age_seconds)
     with SessionLocal() as db:
         rows = (
             db.query(InboxModel.receiver_id)
@@ -2205,6 +2245,10 @@ def delete_flow(name: str) -> bool:
 def get_flows_to_run() -> List[Flow]:
     """Get enabled flows where next_run <= now."""
     with SessionLocal() as db:
+        # Deliberately LOCAL, unlike last_active/created_at: next_run comes from
+        # a cron trigger evaluated against datetime.now() in flow_service, so a
+        # schedule like "0 9 * * *" means 09:00 server-local. Moving only this
+        # comparison to UTC would shift every flow by the server's offset.
         now = datetime.now()
         flows = (
             db.query(FlowModel).filter(FlowModel.enabled == True, FlowModel.next_run <= now).all()

@@ -28,7 +28,11 @@ logger = logging.getLogger(__name__)
 def cleanup_old_data():
     """Clean up terminals, inbox messages, and log files older than RETENTION_DAYS."""
     try:
-        cutoff_date = datetime.now() - timedelta(days=RETENTION_DAYS)
+        # UTC, matching what every compared column holds: terminals.last_active,
+        # inbox.created_at and idempotency_keys.created_at are all UTCDateTime.
+        # One cutoff serves all three, so they move together; a local cutoff
+        # against UTC rows would shift retention by the server's offset.
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
         logger.info(
             f"Starting cleanup of data older than {RETENTION_DAYS} days (before {cutoff_date})"
         )

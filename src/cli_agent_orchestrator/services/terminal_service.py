@@ -24,7 +24,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -1452,7 +1452,7 @@ async def create_terminal(
             group=group,
             metadata=metadata,
             status=initial_status,
-            last_active=datetime.now(),
+            last_active=datetime.now(timezone.utc),
         )
 
         logger.info(
