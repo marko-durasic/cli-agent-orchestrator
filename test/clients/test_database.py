@@ -2,7 +2,7 @@
 
 import sqlite3
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -262,8 +262,12 @@ class TestTerminalOperations:
         Uses the real in-memory DB (not a mocked session) so the age cutoff,
         status filter, and terminal join are actually exercised.
         """
-        old = datetime.now() - timedelta(seconds=120)
-        fresh = datetime.now()
+        # UTC, as the server now stamps created_at. These were naive LOCAL
+        # datetime.now(), which agreed with the old local cutoff and passed only
+        # because writer and reader shared the bug; under a non-UTC TZ a naive
+        # local value read as UTC lands hours in the future.
+        old = datetime.now(timezone.utc) - timedelta(seconds=120)
+        fresh = datetime.now(timezone.utc)
 
         with test_db() as seed:
             seed.add_all(

@@ -31,6 +31,7 @@ Diff granularity (per the design):
   so a change to one counter does not resend the whole object.
 """
 
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 # Top-level snapshot keys whose value is replaced wholesale (never diffed
@@ -203,6 +204,10 @@ def _isoformat(value: Any) -> Optional[str]:
         return None
     if isinstance(value, str):
         return value
+    if isinstance(value, datetime) and value.tzinfo is None:
+        # Naive last_active is UTC (database.as_utc). Emit the offset so a
+        # browser does not parse it as local time.
+        value = value.replace(tzinfo=timezone.utc)
     isoformat = getattr(value, "isoformat", None)
     if callable(isoformat):
         return str(isoformat())
