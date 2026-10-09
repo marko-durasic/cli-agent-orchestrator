@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import (
@@ -540,7 +541,7 @@ class TestCodexBuildCommandExtra:
     def test_security_prompt_prepended_when_tools_restricted(self, mock_load, tmp_path):
         # When ``allowed_tools`` is a restricted set (no "*"), the provider
         # prepends SECURITY_PROMPT plus a "You only have access to these
-        # tools:" hint to the developer_instructions payload.
+        # CAO capabilities:" hint to the developer_instructions payload.
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = "Original system prompt."
@@ -555,7 +556,7 @@ class TestCodexBuildCommandExtra:
             command = provider._build_codex_command()
 
         instructions = read_developer_instructions_file(command)
-        assert "You only have access to these tools: fs_read, fs_list" in instructions
+        assert "You only have access to these CAO capabilities: fs_read, fs_list" in instructions
         assert "Original system prompt." in instructions
         # SECURITY_PROMPT lives in constants; assert on a stable substring
         # rather than importing the constant into the test fixture.
@@ -4289,3 +4290,109 @@ class TestCodexProviderBlocksOrchestratedInputWhileWaitingUserAnswer:
         mock_tmux.send_keys.assert_not_called()
         mock_notify.assert_called_once()
         assert mock_notify.call_args.kwargs["delete_worker"] is False
+
+
+class TestCodexShellCapabilityConstraints:
+    """Compile CAO grants into Codex tool names without changing launch policy."""
+
+    @pytest.mark.parametrize("codex_profile", [None, "contained-supervisor"])
+    def test_shell_grant_is_bound_to_native_tools(self, tmp_path, codex_profile):
+        from cli_agent_orchestrator.constants import SECURITY_PROMPT
+
+        grants = ["@cao-mcp-server", "fs_read", "fs_list", "execute_bash", "discovery"]
+        body = "Use execute_bash/fs_read/fs_list for authorized source inspection."
+        profile = AgentProfile(
+            name="supervisor",
+            description="Synthetic restricted supervisor",
+            allowedTools=list(grants),
+            system_prompt=body,
+            codexProfile=codex_profile,
+            mcpServers={"cao-mcp-server": {"command": "cao-mcp-server", "args": []}},
+        )
+        provider = CodexProvider("alias-test", "sess", "win", "supervisor", allowed_tools=grants)
+        with (
+            patch("cli_agent_orchestrator.providers.codex.CAO_HOME_DIR", tmp_path),
+            patch(
+                "cli_agent_orchestrator.providers.codex.load_agent_profile", return_value=profile
+            ),
+        ):
+            command = provider._build_codex_command()
+
+        instructions = read_developer_instructions_file(command)
+        assert "CAO capabilities: " + ", ".join(grants) in instructions
+        assert "execute_bash -> exec_command, write_stdin" in instructions
+        assert (
+            "write_stdin only for sessions started by permitted exec_command calls made by this agent"
+            in instructions
+        )
+        assert "functions.exec only to dispatch those same permitted calls" in instructions
+        assert "does not grant access to other inner tools" in instructions
+        assert (
+            "functions.wait only to poll cells created by those permitted functions.exec calls made by this agent"
+            in instructions
+        )
+        assert "never use it to inspect or control unrelated cells" in instructions
+        assert (
+            "All existing command, filesystem, network, approval, and MCP restrictions still apply"
+            in instructions
+        )
+        assert _toml_scalar(SECURITY_PROMPT)[1:-1] in instructions
+        assert body in instructions
+        assert profile.allowedTools == grants
+        assert provider._allowed_tools == grants
+        assert "mcp_servers.cao-mcp-server.command=" in command
+        assert "CAO_TERMINAL_ID" in command
+        assert ("--yolo" in command) == (codex_profile is None)
+        assert ("--profile contained-supervisor" in command) == (codex_profile is not None)
+
+    @pytest.mark.parametrize(
+        "grants",
+        [
+            None,
+            [],
+            ["fs_read", "fs_list"],
+            ["@builtin", "fs_*", "web_fetch"],
+            ["@cao-mcp-server", "discovery"],
+            ["execute_bash_extra"],
+            ["*"],
+        ],
+    )
+    def test_absent_shell_grant_adds_no_native_execution_or_wrapper(self, tmp_path, grants):
+        profile = AgentProfile(
+            name="restricted",
+            description="Synthetic no-shell profile",
+            allowedTools=grants,
+            system_prompt="Inspect only the sources permitted by this profile.",
+        )
+        provider = CodexProvider("no-alias", "sess", "win", "restricted", allowed_tools=grants)
+        with (
+            patch("cli_agent_orchestrator.providers.codex.CAO_HOME_DIR", tmp_path),
+            patch(
+                "cli_agent_orchestrator.providers.codex.load_agent_profile", return_value=profile
+            ),
+        ):
+            command = provider._build_codex_command()
+
+        instructions = read_developer_instructions_file(command)
+        for native_tool in ("exec_command", "write_stdin", "functions.exec", "functions.wait"):
+            assert native_tool not in instructions
+        assert provider._allowed_tools == grants
+        assert profile.allowedTools == grants
+
+    def test_shell_binding_does_not_add_discovery(self, tmp_path):
+        profile = AgentProfile(name="shell", description="Shell only", system_prompt="Use shell.")
+        provider = CodexProvider(
+            "shell-only", "sess", "win", "shell", allowed_tools=["execute_bash"]
+        )
+        with (
+            patch("cli_agent_orchestrator.providers.codex.CAO_HOME_DIR", tmp_path),
+            patch(
+                "cli_agent_orchestrator.providers.codex.load_agent_profile", return_value=profile
+            ),
+        ):
+            command = provider._build_codex_command()
+
+        instructions = read_developer_instructions_file(command)
+        assert "execute_bash -> exec_command, write_stdin" in instructions
+        assert "discovery" not in instructions
+        assert "@cao-mcp-server" not in instructions

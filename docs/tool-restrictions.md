@@ -207,7 +207,21 @@ CAO defines a universal tool vocabulary (`execute_bash`, `fs_read`, `fs_write`, 
 | `fs_list` | `Glob`, `Grep` | `list`, `grep` | `Grep`, `Glob` |
 | `web_fetch` | `WebFetch`, `WebSearch` | (not mapped) | `WebFetch`, `WebSearch` + disabled web search |
 
-**Providers that accept CAO vocabulary directly** — Kiro CLI accepts `allowedTools` in the agent JSON at install time, using the same vocabulary as CAO. No translation needed. Kimi CLI, MiniMax Code, and Codex use system prompt instructions to enforce restrictions. CAO passes the `allowedTools` list directly without translation — so no `TOOL_MAPPING` entry exists for them, and none is needed.
+**Providers that accept CAO vocabulary directly** — Kiro CLI accepts `allowedTools` in the agent JSON at install time, using the same vocabulary as CAO. No translation needed. Kimi CLI and MiniMax Code use system prompt instructions with the CAO vocabulary.
+
+**Codex capability bindings** — Codex also uses prompt-level restrictions, but its
+shell tools have different names. CAO preserves the canonical `allowedTools` list
+and binds an explicitly granted `execute_bash` capability to `exec_command` and
+`write_stdin` in the startup policy. `write_stdin` is limited to sessions started
+by this agent's permitted `exec_command` calls. When available, `functions.exec` is permitted
+only as a dispatcher for those same calls, never as a grant to arbitrary inner
+tools, and `functions.wait` may only poll cells created by this agent's permitted
+dispatcher calls. It cannot inspect or control unrelated cells. File, MCP, and
+discovery capabilities do not imply a shell grant. These
+bindings preserve existing command, filesystem, network, approval, and MCP
+restrictions; they do not change Codex's sandbox/approval settings or create
+native tool enforcement. The policy is compiled at launch, so existing terminals
+do not acquire new bindings from a source or profile edit.
 
 ## How Overrides Work
 
@@ -308,11 +322,15 @@ separate from `allowedTools`, including `allowedTools: ["*"]`.
 See the [Grok Build CLI provider guide](grok-cli.md#tool-restrictions) for the
 complete mapping and isolation behavior.
 
-**Kimi CLI / MiniMax Code / Codex** — Prepends to the system or bootstrap prompt:
+**Kimi CLI / MiniMax Code** — Prepends to the system or bootstrap prompt:
 ```
 You may ONLY use these tools: @cao-mcp-server, fs_read, fs_list
 Do NOT attempt to use: execute_bash, fs_write
 ```
+
+**Codex** — Prepends the security constraints, canonical CAO capability list,
+and the applicable provider binding described above. This remains soft
+enforcement; a tool being physically available does not grant permission to use it.
 
 ## Cross-Provider Inheritance
 
