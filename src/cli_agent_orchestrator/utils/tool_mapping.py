@@ -90,6 +90,14 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
     },
 }
 
+# Prompt-only bindings stay separate from TOOL_MAPPING: get_disallowed_tools
+# feeds the CLI's "Blocked" summary, and Codex has no native denylist. File or
+# MCP grants must not imply shell access. Wrapper tools are scoped dispatch /
+# polling mechanisms in the formatter below, never independent capabilities.
+CODEX_CAPABILITY_BINDINGS: Dict[str, List[str]] = {
+    "execute_bash": ["exec_command", "write_stdin"],
+}
+
 # Complete set of all native tools per provider (used to compute disallowed set).
 ALL_NATIVE_TOOLS: Dict[str, Set[str]] = {}
 for _provider, _mapping in TOOL_MAPPING.items():
@@ -229,3 +237,37 @@ def format_tool_summary(allowed: List[str]) -> str:
     if "*" in allowed:
         return "ALL TOOLS (unrestricted)"
     return ", ".join(allowed)
+
+
+def format_codex_tool_constraints(allowed: List[str]) -> str:
+    """Describe CAO grants and their Codex bindings for soft enforcement only.
+
+    Keep the canonical grants intact. In particular, resolving file/MCP
+    capabilities must not turn into a shell grant merely because Codex uses
+    shell tools to implement some file operations. This does not alter the
+    sandbox, approval policy, or the tools actually exposed by Codex.
+    """
+    if "*" in allowed:
+        return ""
+
+    constraint = (
+        f"\nYou only have access to these CAO capabilities: {', '.join(allowed)}\n"
+        "Other capabilities do not grant shell access. "
+        "Shell execution and its dispatch/polling wrappers require an explicit execute_bash grant.\n"
+    )
+    if "execute_bash" in allowed:
+        native_tools = ", ".join(CODEX_CAPABILITY_BINDINGS["execute_bash"])
+        constraint += (
+            f"Codex provider binding: execute_bash -> {native_tools}. "
+            "These are provider names for the granted capability, not additional grants. "
+            "Use only tools actually available in this runtime. "
+            "Use write_stdin only for sessions started by permitted exec_command calls "
+            "made by this agent. "
+            "If available, use functions.exec only to dispatch those same permitted calls; "
+            "it does not grant access to other inner tools. "
+            "If available, use functions.wait only to poll cells created by those permitted "
+            "functions.exec calls made by this agent; never use it to inspect or control "
+            "unrelated cells. "
+            "All existing command, filesystem, network, approval, and MCP restrictions still apply.\n"
+        )
+    return constraint

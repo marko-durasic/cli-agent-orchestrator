@@ -1,0 +1,5 @@
+dureef@ip-172-31-93-223:~/workspace$ ollama run qwen3.5:4b
+pulling manifest
+pulling 2a654d98e6fb: 100% ▕████████████████▏ 3.4 GB
+verifying sha256 digest
+writing manifest

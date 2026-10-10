@@ -3,6 +3,7 @@
 import pytest
 
 from cli_agent_orchestrator.utils.tool_mapping import (
+    format_codex_tool_constraints,
     format_tool_summary,
     get_allowed_tools,
     get_disallowed_tools,
@@ -295,3 +296,57 @@ class TestClaudeCodeSubagentEscape:
 
     def test_unrestricted_star_keeps_everything(self):
         assert get_disallowed_tools("claude_code", ["*"]) == []
+
+
+class TestCodexShellCapabilityMapping:
+    """Codex's execution tools implement the existing CAO shell grant only."""
+
+    def test_execute_bash_maps_to_codex_execution_family(self):
+        allowed = ["@cao-mcp-server", "fs_read", "fs_list", "execute_bash", "discovery"]
+        original = list(allowed)
+
+        assert "execute_bash -> exec_command, write_stdin" in format_codex_tool_constraints(allowed)
+        assert allowed == original
+
+    @pytest.mark.parametrize(
+        "allowed",
+        [
+            [],
+            ["fs_read", "fs_list"],
+            ["@builtin", "fs_*", "web_fetch"],
+            ["@cao-mcp-server", "discovery"],
+            ["execute_bash_extra"],
+        ],
+    )
+    def test_other_capabilities_do_not_grant_codex_execution(self, allowed):
+        result = format_codex_tool_constraints(allowed)
+        assert "Other capabilities do not grant shell access" in result
+        assert (
+            "Shell execution and its dispatch/polling wrappers require an explicit execute_bash grant"
+            in result
+        )
+        for native_tool in ("exec_command", "write_stdin", "functions.exec", "functions.wait"):
+            assert native_tool not in result
+
+    def test_prompt_only_binding_does_not_claim_native_denials(self):
+        # The CLI prints this list as "Blocked"; Codex has no native denylist.
+        assert get_disallowed_tools("codex", ["fs_read", "fs_list"]) == []
+        assert get_allowed_tools("codex", ["execute_bash"]) == []
+
+    def test_codex_mapping_does_not_change_other_providers(self):
+        assert get_allowed_tools("copilot_cli", ["execute_bash"]) == ["shell"]
+        assert get_allowed_tools("grok_cli", ["execute_bash"]) == ["Bash"]
+
+    @pytest.mark.parametrize("allowed", [["*"], ["*", "execute_bash"]])
+    def test_unrestricted_formatter_does_not_add_a_restriction(self, allowed):
+        assert format_codex_tool_constraints(allowed) == ""
+
+    def test_formatter_preserves_canonical_grants_without_mutation(self):
+        allowed = ["fs_read", "execute_bash", "@cao-mcp-server"]
+        original = list(allowed)
+
+        result = format_codex_tool_constraints(allowed)
+
+        assert "CAO capabilities: fs_read, execute_bash, @cao-mcp-server" in result
+        assert "execute_bash -> exec_command, write_stdin" in result
+        assert allowed == original
