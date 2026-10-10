@@ -4,11 +4,15 @@ Publisher: terminal.{id}.output
 """
 
 import logging
+import math
 import os
 import select
+import stat
 import threading
 import time
-from typing import Callable, Dict, Optional, Tuple
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Iterator, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
     FIFO_DIR,
@@ -54,6 +58,16 @@ PaneProbe = Callable[[], str]  # returns the live pane content (tmux capture-pan
 RearmPipe = Callable[[], None]  # re-attaches pipe-pane (stop then start, NOT a bare toggle)
 
 
+@dataclass
+class _ReaderStartup:
+    """One reader generation's fd readiness and startup failure, never reused."""
+
+    identity: Tuple[int, int]
+    finished: threading.Event = field(default_factory=threading.Event)
+    ready: threading.Event = field(default_factory=threading.Event)
+    error: Optional[Exception] = None
+
+
 class FifoManager:
     """Manages FIFO lifecycle: create named pipe, start reader thread, stop and cleanup.
 
@@ -92,6 +106,11 @@ class FifoManager:
         self._readers: Dict[str, threading.Event] = {}  # terminal_id -> stop flag
         self._threads: Dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
+        # Serialize lifecycle operations without holding the bookkeeping lock
+        # while waiting for a reader (the reader itself needs that lock).
+        self._lifecycle_lock = threading.RLock()
+        self._startup: Dict[str, _ReaderStartup] = {}
+        self._no_replay: set[str] = set()
 
         # ---- pipe-pane liveness watchdog state (issue #388) ----
         # Monotonic timestamp of the last time this terminal is considered to
@@ -161,41 +180,221 @@ class FifoManager:
         liveness watchdog (issue #388). Callers that omit them (or backends
         without pipe-pane) get exactly the old behavior — no watchdog.
         """
-        fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+        with self._lifecycle_lock:
+            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
-        enroll = pane_probe is not None and rearm is not None
+            enroll = pane_probe is not None and rearm is not None
 
-        with self._lock:
-            if terminal_id in self._readers:
-                return
+            with self._lock:
+                if terminal_id in self._readers:
+                    return
 
-            if not fifo_path.exists():
-                os.mkfifo(fifo_path)
+                startup = _ReaderStartup(self._fifo_identity(fifo_path, create=True))
+                stop_flag = threading.Event()
+                thread = threading.Thread(
+                    target=self._reader_loop,
+                    args=(terminal_id, fifo_path, stop_flag, startup),
+                    daemon=True,
+                    name=f"fifo-{terminal_id}",
+                )
+                self._readers[terminal_id] = stop_flag
+                self._threads[terminal_id] = thread
+                self._startup[terminal_id] = startup
+                # Seed the liveness clock BEFORE pipe-pane starts so the first
+                # watchdog check has a baseline; the reader bumps it on real data.
+                now = time.monotonic()
+                self._last_data_at[terminal_id] = now
+                self._registered_at[terminal_id] = now
+                self._ever_delivered[terminal_id] = False
+                if enroll:
+                    self._pane_probe[terminal_id] = pane_probe
+                    self._rearm[terminal_id] = rearm
+                thread.start()
 
-            stop_flag = threading.Event()
-            thread = threading.Thread(
-                target=self._reader_loop,
-                args=(terminal_id, fifo_path, stop_flag),
-                daemon=True,
-                name=f"fifo-{terminal_id}",
-            )
-            self._readers[terminal_id] = stop_flag
-            self._threads[terminal_id] = thread
-            # Seed the liveness clock BEFORE pipe-pane starts so the first
-            # watchdog check has a baseline; the reader bumps it on real data.
-            now = time.monotonic()
-            self._last_data_at[terminal_id] = now
-            self._registered_at[terminal_id] = now
-            self._ever_delivered[terminal_id] = False
             if enroll:
+                self._ensure_watchdog()
+
+            logger.info("Started FIFO reader for terminal %s", terminal_id)
+
+    @staticmethod
+    def _fifo_identity(fifo_path, *, create: bool = False) -> Tuple[int, int]:
+        """Create only a missing FIFO; reject symlinks and other path types."""
+        try:
+            info = fifo_path.lstat()
+        except FileNotFoundError:
+            if not create:
+                raise
+            try:
+                os.mkfifo(fifo_path)
+            except FileExistsError:
+                pass
+            info = fifo_path.lstat()
+        if not stat.S_ISFIFO(info.st_mode):
+            raise ValueError(f"FIFO path is not a named pipe (symlinks refused): {fifo_path}")
+        return info.st_dev, info.st_ino
+
+    def ensure_reader(
+        self,
+        terminal_id: str,
+        *,
+        pane_probe: PaneProbe,
+        rearm: RearmPipe,
+        timeout: float = 2.0,
+    ) -> bool:
+        """Restore one reader without unlinking its FIFO or replaying pane output.
+
+        Return True only when a reader was established/replaced; False means
+        its current reader is already ready. Both read and keepalive fds must
+        match the validated FIFO inode before success. The caller owns initial
+        pipe rearming; callbacks enroll the existing watchdog without replay.
+        Startup failures/timeouts are visible and a later call can retry.
+        """
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("FIFO reader timeout must be finite and positive")
+        deadline = time.monotonic() + timeout
+        if not self._lifecycle_lock.acquire(timeout=timeout):
+            raise TimeoutError(f"Timed out waiting for FIFO lifecycle: {terminal_id}")
+        try:
+            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+            identity = self._fifo_identity(fifo_path, create=True)
+            with self._lock:
+                thread = self._threads.get(terminal_id)
+                stop_flag = self._readers.get(terminal_id)
+                startup = self._startup.get(terminal_id)
+            healthy = False
+            if thread is not None and thread.is_alive() and stop_flag and not stop_flag.is_set():
+                if startup is not None:
+                    startup.finished.wait(max(0.0, deadline - time.monotonic()))
+                    healthy = startup.ready.is_set() and startup.identity == identity
+            if not healthy:
+                if stop_flag is not None:
+                    stop_flag.set()
+                if thread is not None and thread.is_alive():
+                    thread.join(timeout=max(0.0, deadline - time.monotonic()))
+                    if thread.is_alive():
+                        raise TimeoutError(f"Timed out stopping unready FIFO reader: {terminal_id}")
+                with self._lock:
+                    self._readers.pop(terminal_id, None)
+                    self._threads.pop(terminal_id, None)
+                    self._startup.pop(terminal_id, None)
+                    self._liveness.pop(terminal_id, None)
+                    self._rearm_failures.pop(terminal_id, None)
+                    self._cold_start_attempts.pop(terminal_id, None)
+                    self._probe_failures.pop(terminal_id, None)
+                    # Until fds are ready, do not let the watchdog use a stale
+                    # generation's callbacks against an unready replacement.
+                    self._pane_probe.pop(terminal_id, None)
+                    self._rearm.pop(terminal_id, None)
+                self.create_reader(terminal_id)
+                startup = self._startup[terminal_id]
+                stop_flag = self._readers[terminal_id]
+                if not startup.finished.wait(max(0.0, deadline - time.monotonic())):
+                    stop_flag.set()
+                    raise TimeoutError(f"Timed out opening FIFO reader: {terminal_id}")
+                if startup.error is not None:
+                    raise RuntimeError(
+                        f"FIFO reader failed to open: {terminal_id}"
+                    ) from startup.error
+            # Both a healthy generation and a newly created one have these
+            # handles; make that branch invariant explicit before validation.
+            assert startup is not None and stop_flag is not None
+            # Recheck without creating a path: a concurrent removal/replacement
+            # must fail visibly and stop this generation without touching it.
+            try:
+                identity = self._fifo_identity(fifo_path)
+            except (OSError, ValueError):
+                stop_flag.set()
+                raise
+            if (
+                not startup.ready.is_set()
+                or not self._threads[terminal_id].is_alive()
+                or identity != startup.identity
+            ):
+                stop_flag.set()
+                raise RuntimeError(f"FIFO reader is not ready for its path: {terminal_id}")
+            with self._lock:
                 self._pane_probe[terminal_id] = pane_probe
                 self._rearm[terminal_id] = rearm
-            thread.start()
-
-        if enroll:
+                self._no_replay.add(terminal_id)
             self._ensure_watchdog()
+            return not healthy
+        finally:
+            self._lifecycle_lock.release()
 
-        logger.info("Started FIFO reader for terminal %s", terminal_id)
+    @contextmanager
+    def recovery_reader(
+        self,
+        terminal_id: str,
+        *,
+        pane_probe: PaneProbe,
+        rearm: RearmPipe,
+        timeout: float = 2.0,
+    ) -> Iterator[bool]:
+        """Roll back only this recovery's new reader if its caller fails.
+
+        Capture the exact generation atomically with establishment, then release
+        the lifecycle lock while the caller verifies/rearms its terminal. A
+        concurrent deletion or replacement is allowed and must never be undone.
+        Rollback leaves the FIFO inode intact and keeps pre-existing readers.
+        """
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("FIFO reader timeout must be finite and positive")
+        deadline = time.monotonic() + timeout
+        if not self._lifecycle_lock.acquire(timeout=timeout):
+            raise TimeoutError(f"Timed out waiting for FIFO lifecycle: {terminal_id}")
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Timed out waiting for FIFO lifecycle: {terminal_id}")
+            restored = self.ensure_reader(
+                terminal_id, pane_probe=pane_probe, rearm=rearm, timeout=remaining
+            )
+            startup = self._startup[terminal_id]
+            stop_flag = self._readers[terminal_id]
+            thread = self._threads[terminal_id]
+        finally:
+            self._lifecycle_lock.release()
+        try:
+            yield restored
+        except BaseException:
+            if restored:
+                with self._lifecycle_lock:
+                    with self._lock:
+                        current = (
+                            self._startup.get(terminal_id) is startup
+                            and self._readers.get(terminal_id) is stop_flag
+                            and self._threads.get(terminal_id) is thread
+                        )
+                    if current:
+                        stop_flag.set()
+                        thread.join(timeout=timeout)
+                        if thread.is_alive():
+                            # Retain this stopped generation for a later ensure
+                            # to join, rather than permit a duplicate live reader.
+                            logger.warning("FIFO rollback reader did not exit: %s", terminal_id)
+                        else:
+                            with self._lock:
+                                self._detach_reader_locked(terminal_id)
+            raise
+
+    def _detach_reader_locked(
+        self, terminal_id: str
+    ) -> Tuple[Optional[threading.Event], Optional[threading.Thread]]:
+        """Forget one generation; caller holds both lifecycle and state locks."""
+        stop_flag = self._readers.pop(terminal_id, None)
+        thread = self._threads.pop(terminal_id, None)
+        self._startup.pop(terminal_id, None)
+        self._no_replay.discard(terminal_id)
+        self._pane_probe.pop(terminal_id, None)
+        self._rearm.pop(terminal_id, None)
+        self._liveness.pop(terminal_id, None)
+        self._last_data_at.pop(terminal_id, None)
+        self._rearm_failures.pop(terminal_id, None)
+        self._registered_at.pop(terminal_id, None)
+        self._ever_delivered.pop(terminal_id, None)
+        self._cold_start_attempts.pop(terminal_id, None)
+        self._probe_failures.pop(terminal_id, None)
+        return stop_flag, thread
 
     def stop_reader(self, terminal_id: str) -> None:
         """Stop the reader thread (if running) and delete the FIFO file.
@@ -206,62 +405,59 @@ class FifoManager:
         ``*.fifo`` files may still be on disk. Without it those files would
         accumulate unbounded.
         """
-        with self._lock:
-            stop_flag = self._readers.pop(terminal_id, None)
-            thread = self._threads.pop(terminal_id, None)
-            # Drop watchdog bookkeeping so a re-created terminal starts clean and
-            # the watchdog stops probing a gone pane.
-            self._pane_probe.pop(terminal_id, None)
-            self._rearm.pop(terminal_id, None)
-            self._liveness.pop(terminal_id, None)
-            self._last_data_at.pop(terminal_id, None)
-            self._rearm_failures.pop(terminal_id, None)
-            self._registered_at.pop(terminal_id, None)
-            self._ever_delivered.pop(terminal_id, None)
-            self._cold_start_attempts.pop(terminal_id, None)
-            self._probe_failures.pop(terminal_id, None)
+        with self._lifecycle_lock:
+            with self._lock:
+                # Drop all bookkeeping so recreation starts clean and no
+                # watchdog callback remains enrolled for a removed terminal.
+                stop_flag, thread = self._detach_reader_locked(terminal_id)
 
-        # Deliberately NOT stopping the watchdog thread here even when this was
-        # the last enrolled terminal: doing it under a "now idle" check raced
-        # against a concurrent create_reader() enrolling a new terminal between
-        # this method releasing the lock and calling stop_watchdog() — the
-        # watchdog thread that create_reader's _ensure_watchdog() decided was
-        # still alive and reusable could be torn down out from under the newly
-        # enrolled terminal, leaving it silently unwatched. A single lingering
-        # thread waking every PIPE_LIVENESS_CHECK_INTERVAL_S to iterate an empty
-        # dict is a cheap, correctness-preserving tradeoff instead; it is
-        # actually torn down at process shutdown (api/main.py's lifespan).
-        fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+            # Deliberately NOT stopping the watchdog thread here even when this was
+            # the last enrolled terminal: doing it under a "now idle" check raced
+            # against a concurrent create_reader() enrolling a new terminal between
+            # this method releasing the lock and calling stop_watchdog() — the
+            # watchdog thread that create_reader's _ensure_watchdog() decided was
+            # still alive and reusable could be torn down out from under the newly
+            # enrolled terminal, leaving it silently unwatched. A single lingering
+            # thread waking every PIPE_LIVENESS_CHECK_INTERVAL_S to iterate an empty
+            # dict is a cheap, correctness-preserving tradeoff instead; it is
+            # actually torn down at process shutdown (api/main.py's lifespan).
+            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
-        if stop_flag and thread:
-            # The reader never blocks in open()/read() (non-blocking fd +
-            # select with a timeout), so setting the flag is sufficient — it is
-            # observed within one poll interval. No write-side "wakeup" open is
-            # needed; the old wakeup raced with the reader's reopen cycle and
-            # could strand the thread forever in a blocking FIFO open on an
-            # unlinked inode (issue #382).
-            stop_flag.set()
-            thread.join(timeout=2.0)
-            if thread.is_alive():
-                # Never silent: a leaked reader thread was how #382's wedge
-                # built up. With the non-blocking loop this should not happen.
-                logger.warning(
-                    "FIFO reader thread for terminal %s did not exit "
-                    "within 2s; leaking a daemon thread",
-                    terminal_id,
-                )
-            else:
-                logger.info("Stopped FIFO reader for terminal %s", terminal_id)
+            if stop_flag and thread:
+                # The reader never blocks in open()/read() (non-blocking fd +
+                # select with a timeout), so setting the flag is sufficient — it is
+                # observed within one poll interval. No write-side "wakeup" open is
+                # needed; the old wakeup raced with the reader's reopen cycle and
+                # could strand the thread forever in a blocking FIFO open on an
+                # unlinked inode (issue #382).
+                stop_flag.set()
+                thread.join(timeout=2.0)
+                if thread.is_alive():
+                    # Never silent: a leaked reader thread was how #382's wedge
+                    # built up. With the non-blocking loop this should not happen.
+                    logger.warning(
+                        "FIFO reader thread for terminal %s did not exit "
+                        "within 2s; leaking a daemon thread",
+                        terminal_id,
+                    )
+                else:
+                    logger.info("Stopped FIFO reader for terminal %s", terminal_id)
 
-        # Best-effort unlink regardless of whether a reader was tracked — when
-        # none is tracked there is no active reader holding the FIFO, so removing
-        # a stale file on disk is safe.
-        try:
-            fifo_path.unlink()
-        except OSError:
-            pass
+            # Best-effort unlink regardless of whether a reader was tracked — when
+            # none is tracked there is no active reader holding the FIFO, so removing
+            # a stale file on disk is safe.
+            try:
+                fifo_path.unlink()
+            except OSError:
+                pass
 
-    def _reader_loop(self, terminal_id: str, fifo_path, stop_flag: threading.Event) -> None:
+    def _reader_loop(
+        self,
+        terminal_id: str,
+        fifo_path,
+        stop_flag: threading.Event,
+        startup: Optional[_ReaderStartup] = None,
+    ) -> None:
         """Read chunks from FIFO and publish to the event bus.
 
         Never blocks in a FIFO ``open()`` (issue #382): the previous design
@@ -308,9 +504,23 @@ class FifoManager:
         try:
             # Non-blocking read open of a FIFO succeeds immediately (POSIX),
             # writer attached or not.
-            read_fd = os.open(str(fifo_path), os.O_RDONLY | os.O_NONBLOCK)
+            flags = os.O_NONBLOCK | os.O_NOFOLLOW
+            read_fd = os.open(str(fifo_path), os.O_RDONLY | flags)
+            read_info = os.fstat(read_fd)
+            identity = (read_info.st_dev, read_info.st_ino)
+            if not stat.S_ISFIFO(read_info.st_mode) or (startup and startup.identity != identity):
+                raise ValueError(f"FIFO read fd does not match its path: {fifo_path}")
             # With our read end open, a non-blocking write open cannot ENXIO.
-            keepalive_fd = os.open(str(fifo_path), os.O_WRONLY | os.O_NONBLOCK)
+            keepalive_fd = os.open(str(fifo_path), os.O_WRONLY | flags)
+            write_info = os.fstat(keepalive_fd)
+            if not stat.S_ISFIFO(write_info.st_mode) or identity != (
+                write_info.st_dev,
+                write_info.st_ino,
+            ):
+                raise ValueError(f"FIFO keepalive fd does not match read fd: {fifo_path}")
+            if startup is not None and not stop_flag.is_set():
+                startup.ready.set()
+                startup.finished.set()
 
             while not stop_flag.is_set():
                 # Wait at most _COALESCE_WINDOW so we always flush pending data
@@ -366,9 +576,13 @@ class FifoManager:
                     bus.publish(topic, {"data": pending.decode("utf-8", errors="replace")})
                     pending.clear()
         except Exception as e:
+            if startup is not None:
+                startup.error = e
             if not stop_flag.is_set():
                 logger.error("FIFO reader for terminal %s exiting on error: %s", terminal_id, e)
         finally:
+            if startup is not None:
+                startup.ready.clear()
             # Flush any unpublished bytes so the last frame of a torn-down
             # terminal isn't lost — status/log consumers may need it.
             if pending:
@@ -382,6 +596,8 @@ class FifoManager:
                         os.close(fd)
                     except OSError:
                         pass
+            if startup is not None:
+                startup.finished.set()
 
     # ---- pipe-pane liveness watchdog (issue #388) ---------------------------
 
@@ -546,8 +762,12 @@ class FifoManager:
             # keep exercising only the pre-existing divergence path.
             ever_delivered = self._ever_delivered.get(terminal_id, True)
             registered_at = self._registered_at.get(terminal_id)
+            # A recovered pane may have rendered its idle prompt before this
+            # reader attached. Silence is expected: only subsequent viewport
+            # divergence can establish a stall for recovery/no-replay readers.
             if (
-                not ever_delivered
+                terminal_id not in self._no_replay
+                and not ever_delivered
                 and registered_at is not None
                 and now - registered_at >= PIPE_LIVENESS_COLD_START_GRACE_S
                 and content.strip()
@@ -744,6 +964,10 @@ class FifoManager:
             if terminal_id not in self._pane_probe:
                 return
             self._rearm_failures.pop(terminal_id, None)
+            # Recovery obtains status through confirmed viewport probes. A
+            # synthetic event would bypass that confirmation and duplicate logs.
+            if terminal_id in self._no_replay:
+                return
             self._last_data_at[terminal_id] = time.monotonic()
 
         bus.publish(f"terminal.{terminal_id}.output", {"data": replay})

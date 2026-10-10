@@ -1076,3 +1076,309 @@ class TestConcurrencyRaces:
             "exactly the kind of unhandled RuntimeError that would kill it"
         )
         assert not watchdog.is_alive(), "watchdog thread must exit cleanly once stopped"
+
+
+class TestEnsureReader:
+    """Targeted recovery must restore one usable reader without replacing its FIFO."""
+
+    @pytest.fixture
+    def manager(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(fr, "FIFO_DIR", tmp_path)
+        manager = FifoManager()
+        # Exercise actual FIFO/thread behavior, but no unrelated timed probes.
+        monkeypatch.setattr(manager, "_ensure_watchdog", lambda: None)
+        yield manager
+        for terminal_id in list(manager._readers):
+            manager.stop_reader(terminal_id)
+        manager.stop_watchdog()
+
+    def _ensure(self, manager, terminal_id="recover", **kwargs):
+        return manager.ensure_reader(
+            terminal_id,
+            pane_probe=lambda: pytest.fail("recovery must not capture/replay output"),
+            rearm=lambda: pytest.fail("the service owns initial pipe rearm"),
+            **kwargs,
+        )
+
+    def test_existing_fifo_inode_survives_and_repeat_is_healthy(self, manager, tmp_path):
+        fifo = tmp_path / "recover.fifo"
+        os.mkfifo(fifo)
+        inode = fifo.stat().st_ino
+
+        assert self._ensure(manager) is True
+        thread = manager._threads["recover"]
+        assert thread.is_alive()
+        # This would fail with ENXIO if the read fd were not established yet.
+        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+        assert self._ensure(manager) is False
+        assert manager._threads["recover"] is thread
+        assert fifo.stat().st_ino == inode
+        assert "recover" in manager._pane_probe
+
+    @pytest.mark.parametrize("kind", ["regular", "directory", "symlink", "dangling_symlink"])
+    def test_rejects_non_fifo_paths_without_replacing_them(self, manager, tmp_path, kind):
+        fifo = tmp_path / "recover.fifo"
+        if kind == "regular":
+            fifo.write_text("must survive")
+        elif kind == "directory":
+            fifo.mkdir()
+        else:
+            target = tmp_path / "target"
+            if kind == "symlink":
+                os.mkfifo(target)
+            fifo.symlink_to(target)
+        original = fifo.lstat()
+
+        with pytest.raises((ValueError, OSError), match="FIFO|fifo|symlink"):
+            self._ensure(manager)
+
+        assert fifo.lstat().st_ino == original.st_ino
+        assert "recover" not in manager._threads
+
+    @pytest.mark.parametrize("failed_flags", [os.O_RDONLY, os.O_WRONLY])
+    def test_open_failure_is_visible_and_retry_preserves_inode(
+        self, manager, tmp_path, monkeypatch, failed_flags
+    ):
+        real_open = os.open
+
+        def failing_open(path, flags, *args, **kwargs):
+            if str(path).endswith("recover.fifo") and flags & os.O_ACCMODE == failed_flags:
+                raise PermissionError("injected FIFO open failure")
+            return real_open(path, flags, *args, **kwargs)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(fr.os, "open", failing_open)
+            with pytest.raises((RuntimeError, OSError), match="FIFO|fifo"):
+                self._ensure(manager)
+        fifo = tmp_path / "recover.fifo"
+        inode = fifo.stat().st_ino
+        manager._threads["recover"].join(timeout=1)
+
+        assert self._ensure(manager) is True
+        assert fifo.stat().st_ino == inode
+
+    def test_replaces_dead_tracked_creation_reader(self, manager, tmp_path, monkeypatch):
+        with monkeypatch.context() as patcher:
+            patcher.setattr(fr.os, "open", lambda *a, **kw: (_ for _ in ()).throw(OSError("fail")))
+            manager.create_reader("recover")
+            old = manager._threads["recover"]
+            old.join(timeout=1)
+            assert not old.is_alive()
+        inode = (tmp_path / "recover.fifo").stat().st_ino
+
+        assert self._ensure(manager) is True
+        assert manager._threads["recover"] is not old
+        assert (tmp_path / "recover.fifo").stat().st_ino == inode
+
+    def test_waits_for_keepalive_open_before_success(self, manager, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+
+        opening_keepalive = threading.Event()
+        release_keepalive = threading.Event()
+        real_open = os.open
+
+        def delayed_open(path, flags, *args, **kwargs):
+            if str(path).endswith("recover.fifo") and flags & os.O_ACCMODE == os.O_WRONLY:
+                opening_keepalive.set()
+                assert release_keepalive.wait(timeout=2)
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(fr.os, "open", delayed_open)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(self._ensure, manager)
+            try:
+                assert opening_keepalive.wait(timeout=1)
+                assert not result.done()
+            finally:
+                release_keepalive.set()
+            assert result.result(timeout=2) is True
+
+    def test_timeout_is_visible_and_late_open_can_be_retried(self, manager, tmp_path, monkeypatch):
+        release_keepalive = threading.Event()
+        real_open = os.open
+
+        def delayed_open(path, flags, *args, **kwargs):
+            if str(path).endswith("recover.fifo") and flags & os.O_ACCMODE == os.O_WRONLY:
+                assert release_keepalive.wait(timeout=2)
+            return real_open(path, flags, *args, **kwargs)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(fr.os, "open", delayed_open)
+            try:
+                with pytest.raises(TimeoutError, match="FIFO|fifo"):
+                    self._ensure(manager, timeout=0.02)
+                inode = (tmp_path / "recover.fifo").stat().st_ino
+            finally:
+                release_keepalive.set()
+                if "recover" in manager._threads:
+                    manager._threads["recover"].join(timeout=1)
+        assert self._ensure(manager) is True
+        assert (tmp_path / "recover.fifo").stat().st_ino == inode
+
+    def test_concurrent_recovery_starts_only_one_reader(self, manager):
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(lambda _: self._ensure(manager), range(6)))
+        assert results.count(True) == 1
+        assert results.count(False) == 5
+        assert len([t for t in threading.enumerate() if t.name == "fifo-recover"]) == 1
+
+    @pytest.mark.parametrize("existing", [False, True])
+    def test_recovery_watchdog_rearms_without_synthetic_output(
+        self, manager, monkeypatch, existing
+    ):
+        if existing:
+            manager.create_reader("recover")
+        published = []
+        rearms = []
+        monkeypatch.setattr(fr.bus, "publish", lambda *args: published.append(args))
+        pane = {"content": "original pane"}
+        manager.ensure_reader(
+            "recover", pane_probe=lambda: pane["content"], rearm=lambda: rearms.append(1)
+        )
+        manager._registered_at["recover"] = (
+            time.monotonic() - fr.PIPE_LIVENESS_COLD_START_GRACE_S - 1
+        )
+        last_data = manager._last_data_at["recover"]
+
+        manager._check_pipe_liveness("recover")  # Establish the recovered baseline.
+        pane["content"] = "pane changed without FIFO delivery"
+        for _ in range(fr.PIPE_LIVENESS_STALL_CHECKS):
+            manager._check_pipe_liveness("recover")
+
+        assert rearms == [1]
+        assert published == []
+        assert manager._last_data_at["recover"] == last_data
+
+    @pytest.mark.parametrize("replacement", ["regular", "missing"])
+    def test_path_change_after_open_fails_without_leaking_or_recreating(
+        self, manager, tmp_path, monkeypatch, replacement
+    ):
+        fifo = tmp_path / "recover.fifo"
+        real_identity = manager._fifo_identity
+        checks = 0
+
+        def change_after_open(path, **kwargs):
+            nonlocal checks
+            checks += 1
+            if checks == 3:
+                path.unlink()
+                if replacement == "regular":
+                    path.write_text("replacement must survive")
+            return real_identity(path, **kwargs)
+
+        monkeypatch.setattr(manager, "_fifo_identity", change_after_open)
+        with pytest.raises((ValueError, OSError, RuntimeError), match="FIFO|fifo"):
+            self._ensure(manager)
+        assert manager._readers["recover"].is_set()
+        manager._threads["recover"].join(timeout=1)
+        assert not manager._threads["recover"].is_alive()
+        if replacement == "regular":
+            assert fifo.read_text() == "replacement must survive"
+        else:
+            assert not fifo.exists()
+
+    def test_lifecycle_lock_wait_obeys_timeout(self, manager):
+        from concurrent.futures import ThreadPoolExecutor
+
+        with manager._lifecycle_lock:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                result = pool.submit(self._ensure, manager, timeout=0.02)
+                with pytest.raises(TimeoutError, match="FIFO|fifo"):
+                    result.result(timeout=1)
+        assert manager._threads == {}
+
+    @pytest.mark.parametrize("existing", [False, True])
+    def test_quiet_recovered_pane_remains_watched_after_cold_start_grace(self, manager, existing):
+        if existing:
+            manager.create_reader("recover")
+        rearms = []
+        manager.ensure_reader(
+            "recover", pane_probe=lambda: "unchanged idle prompt", rearm=lambda: rearms.append(1)
+        )
+        for _ in range(fr.PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS + 2):
+            manager._registered_at["recover"] = (
+                time.monotonic() - fr.PIPE_LIVENESS_COLD_START_GRACE_S - 1
+            )
+            manager._check_pipe_liveness("recover")
+
+        assert rearms == []
+        assert "recover" in manager._pane_probe
+        assert "recover" in manager._rearm
+        assert manager._ever_delivered["recover"] is False
+        assert manager._cold_start_attempts.get("recover", 0) == 0
+
+    def test_failed_recovery_rolls_back_new_generation_without_unlinking(self, manager, tmp_path):
+        with pytest.raises(RuntimeError, match="target disappeared"):
+            with manager.recovery_reader(
+                "recover", pane_probe=lambda: "idle", rearm=lambda: None
+            ) as restored:
+                assert restored is True
+                thread = manager._threads["recover"]
+                inode = (tmp_path / "recover.fifo").stat().st_ino
+                raise RuntimeError("target disappeared after deletion passed stop_reader")
+
+        assert not thread.is_alive()
+        assert "recover" not in manager._readers
+        assert "recover" not in manager._threads
+        assert "recover" not in manager._pane_probe
+        assert "recover" not in manager._startup
+        assert "recover" not in manager._no_replay
+        assert (tmp_path / "recover.fifo").stat().st_ino == inode
+
+    def test_failed_recovery_preserves_existing_healthy_generation(self, manager, tmp_path):
+        self._ensure(manager)
+        thread = manager._threads["recover"]
+        inode = (tmp_path / "recover.fifo").stat().st_ino
+
+        with pytest.raises(RuntimeError, match="target disappeared"):
+            with manager.recovery_reader(
+                "recover", pane_probe=lambda: "idle", rearm=lambda: None
+            ) as restored:
+                assert restored is False
+                raise RuntimeError("target disappeared")
+
+        assert manager._threads["recover"] is thread
+        assert thread.is_alive()
+        assert (tmp_path / "recover.fifo").stat().st_ino == inode
+
+    def test_failed_recovery_preserves_concurrent_replacement(self, manager, tmp_path):
+        from concurrent.futures import ThreadPoolExecutor
+
+        def replace_reader():
+            manager.stop_reader("recover")
+            self._ensure(manager)
+
+        with pytest.raises(RuntimeError, match="target changed"):
+            with manager.recovery_reader(
+                "recover", pane_probe=lambda: "old target", rearm=lambda: None
+            ) as restored:
+                assert restored is True
+                old_thread = manager._threads["recover"]
+                # A different thread must be able to delete and replace while
+                # the service verifies identity; no lifecycle lock spans yield.
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    pool.submit(replace_reader).result(timeout=2)
+                replacement = manager._threads["recover"]
+                inode = (tmp_path / "recover.fifo").stat().st_ino
+                raise RuntimeError("target changed")
+
+        assert not old_thread.is_alive()
+        assert manager._threads["recover"] is replacement
+        assert replacement.is_alive()
+        assert not manager._readers["recover"].is_set()
+        assert (tmp_path / "recover.fifo").stat().st_ino == inode
+
+    def test_successful_recovery_context_keeps_reader(self, manager, tmp_path):
+        with manager.recovery_reader(
+            "recover", pane_probe=lambda: "idle", rearm=lambda: None
+        ) as restored:
+            assert restored is True
+            thread = manager._threads["recover"]
+            inode = (tmp_path / "recover.fifo").stat().st_ino
+
+        assert manager._threads["recover"] is thread
+        assert thread.is_alive()
+        assert (tmp_path / "recover.fifo").stat().st_ino == inode

@@ -8,7 +8,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -17,6 +17,7 @@ from cli_agent_orchestrator.constants import (
     PYTE_SCREEN_ROWS,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -79,6 +80,16 @@ STALE_PROCESSING_BUFFER_QUIET_S = 3.0
 STALE_PROCESSING_CONFIRM_TTL_S = 2 * STALE_PROCESSING_CAPTURE_INTERVAL_S
 
 
+class _BootstrapIdentity(NamedTuple):
+    """One recovery attempt for one provider and an immutable live-pane target."""
+
+    provider: BaseProvider
+    session_name: str
+    window_name: str
+    capture: Callable[[], str]
+    identity_check: Callable[[], bool]
+
+
 class StatusMonitor:
     """Accumulates terminal output into rolling buffers and detects status changes."""
 
@@ -138,6 +149,10 @@ class StatusMonitor:
         # applied across that boundary would consume the arm and latch-block the new
         # turn's genuine PROCESSING.
         self._capture_generation: Dict[str, int] = {}
+        # Recovery-only identity tokens. A new attempt/provider/pane starts a
+        # new two-read pair. Removing the token on clear/reset also rejects
+        # in-flight reads even when the numeric generation resets to zero.
+        self._bootstrap_identities: Dict[str, _BootstrapIdentity] = {}
         # --- pyte rendered-screen detection state (only used when CAO_PYTE_STATUS
         # is on AND the provider opts in via supports_screen_detection) ---
         # Per-terminal pyte Screen+Stream that composites the raw byte stream
@@ -629,6 +644,7 @@ class StatusMonitor:
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
+            self._bootstrap_identities.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -653,6 +669,7 @@ class StatusMonitor:
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
+            self._bootstrap_identities.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -785,8 +802,130 @@ class StatusMonitor:
                             return current_last_status
         return cached
 
+    def bootstrap_status(
+        self,
+        terminal_id: str,
+        *,
+        capture: Callable[[], str],
+        identity_check: Callable[[], bool],
+    ) -> TerminalStatus:
+        """Opt-in, status-only recovery for an UNKNOWN existing terminal.
+
+        The caller holds the session lifecycle lock and supplies a viewport-only
+        capture pinned to an immutable pane ID, plus a DB/live-identity check.
+        Reuse the same callbacks for both samples in one recovery attempt. No
+        provider is initialized, no input is sent, and captured text never enters
+        the rolling buffer or output event stream. Known pipeline status is left
+        untouched; normal UNKNOWN polling never calls this method.
+        """
+        with self._lock:
+            cached = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            if cached != TerminalStatus.UNKNOWN:
+                return cached
+            identity = self._bootstrap_identities.get(terminal_id)
+        try:
+            if not identity_check():
+                self._discard_bootstrap_candidate(terminal_id, identity)
+                return TerminalStatus.UNKNOWN
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception:
+            logger.debug("Status bootstrap identity/provider lookup failed for %s", terminal_id)
+            self._discard_bootstrap_candidate(terminal_id, identity)
+            return TerminalStatus.UNKNOWN
+        if provider is None:
+            self._discard_bootstrap_candidate(terminal_id, identity)
+            return TerminalStatus.UNKNOWN
+
+        with self._lock:
+            cached = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            if cached != TerminalStatus.UNKNOWN:
+                return cached
+            identity = self._bootstrap_identities.get(terminal_id)
+            if (
+                identity is None
+                or identity.provider is not provider
+                or identity.session_name != provider.session_name
+                or identity.window_name != provider.window_name
+                or identity.capture is not capture
+                or identity.identity_check is not identity_check
+            ):
+                identity = _BootstrapIdentity(
+                    provider, provider.session_name, provider.window_name, capture, identity_check
+                )
+                self._bootstrap_identities[terminal_id] = identity
+                self._pending_stale_capture.pop(terminal_id, None)
+            generation = self._capture_generation.get(terminal_id, 0)
+            changed_at = self._buffer_changed_at.get(terminal_id)
+            if changed_at is not None and (
+                time.monotonic() - changed_at < STALE_PROCESSING_BUFFER_QUIET_S
+            ):
+                return TerminalStatus.UNKNOWN
+
+        detected = self._fresh_capture_pane_status(
+            terminal_id,
+            generation,
+            capture=capture,
+            identity_check=identity_check,
+            bootstrap_identity=identity,
+        )
+        try:
+            live_identity_current = identity_check()
+        except Exception:
+            live_identity_current = False
+        with self._lock:
+            identity_current = self._bootstrap_identity_current_locked(terminal_id, identity)
+            if not live_identity_current or not identity_current:
+                if self._bootstrap_identities.get(terminal_id) is identity:
+                    self._pending_stale_capture.pop(terminal_id, None)
+                return TerminalStatus.UNKNOWN
+            current = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            if (
+                current != TerminalStatus.UNKNOWN
+                or self._capture_generation.get(terminal_id, 0) != generation
+                or detected is None
+                or detected == TerminalStatus.UNKNOWN
+            ):
+                return current
+            changed = self._apply_detection_locked(terminal_id, detected)
+        if changed:
+            bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
+            logger.info("Terminal %s status bootstrapped: %s", terminal_id, detected.value)
+        return detected
+
+    def _bootstrap_identity_current_locked(
+        self, terminal_id: str, identity: _BootstrapIdentity
+    ) -> bool:
+        """Cheap identity guard; caller holds the monitor lock.
+
+        Inspect the existing provider mapping rather than get_provider(): a
+        validation must not lazily recreate a provider removed during deletion.
+        The service's lifecycle lock serializes normal provider replacement.
+        """
+        return (
+            self._bootstrap_identities.get(terminal_id) is identity
+            and provider_manager._providers.get(terminal_id) is identity.provider
+            and identity.provider.session_name == identity.session_name
+            and identity.provider.window_name == identity.window_name
+        )
+
+    def _discard_bootstrap_candidate(
+        self, terminal_id: str, identity: Optional[_BootstrapIdentity]
+    ) -> None:
+        """A failed recovery observation breaks its consecutive-sample pair."""
+        if identity is None:
+            return
+        with self._lock:
+            if self._bootstrap_identities.get(terminal_id) is identity:
+                self._pending_stale_capture.pop(terminal_id, None)
+
     def _fresh_capture_pane_status(
-        self, terminal_id: str, generation: int
+        self,
+        terminal_id: str,
+        generation: int,
+        *,
+        capture: Optional[Callable[[], str]] = None,
+        identity_check: Optional[Callable[[], bool]] = None,
+        bootstrap_identity: Optional[_BootstrapIdentity] = None,
     ) -> Optional[TerminalStatus]:
         """Re-detect a stuck-PROCESSING terminal from a fresh pane capture (#558).
 
@@ -842,26 +981,44 @@ class StatusMonitor:
 
         Returns ``None`` when skipped (rate-limited, no provider, unroutable detector,
         unconfirmed candidate, or any read/detection failure) — the caller treats that
-        identically to "still PROCESSING", never as a signal to change status. Only ever
-        called when cached status is already PROCESSING, so every failure path degrades
-        to today's behavior, never past it.
+        identically to "no new signal". Normal polling calls this only for PROCESSING;
+        explicit recovery can also bootstrap UNKNOWN using pinned capture/identity
+        callbacks. Those callbacks never feed captured text into the output pipeline.
         """
+        if identity_check is not None:
+            try:
+                if not identity_check():
+                    self._discard_bootstrap_candidate(terminal_id, bootstrap_identity)
+                    return None
+            except Exception:
+                self._discard_bootstrap_candidate(terminal_id, bootstrap_identity)
+                return None
         now = time.monotonic()
         with self._lock:
+            if bootstrap_identity is not None and not self._bootstrap_identity_current_locked(
+                terminal_id, bootstrap_identity
+            ):
+                return None
             last_check = self._last_stale_capture_check.get(terminal_id)
             if last_check is not None and now - last_check < STALE_PROCESSING_CAPTURE_INTERVAL_S:
                 return None
             self._last_stale_capture_check[terminal_id] = now
 
         try:
-            provider = provider_manager.get_provider(terminal_id)
+            provider = (
+                bootstrap_identity.provider
+                if bootstrap_identity is not None
+                else provider_manager.get_provider(terminal_id)
+            )
         except Exception as e:
             # get_provider() raises (not returns None) for a terminal it doesn't
             # recognize (not yet / no longer in the DB) — same defensive shape as
             # get_status()'s own event-inbox branch.
             logger.debug(f"_fresh_capture_pane_status [{terminal_id}]: get_provider failed: {e}")
+            self._discard_bootstrap_candidate(terminal_id, bootstrap_identity)
             return None
         if provider is None:
+            self._discard_bootstrap_candidate(terminal_id, bootstrap_identity)
             return None
 
         use_screen = getattr(provider, "supports_screen_detection", False)
@@ -871,6 +1028,7 @@ class StatusMonitor:
             # docstring — so don't capture at all. Self-heal is opt-in via either flag,
             # never a guess; these providers stay PROCESSING until the pipeline resolves
             # them.
+            self._discard_bootstrap_candidate(terminal_id, bootstrap_identity)
             return None
 
         try:
@@ -881,18 +1039,24 @@ class StatusMonitor:
             # includes scrollback, and detectors that match anywhere in their input
             # (kiro/kimi ERROR indicators) would resurrect text from finished turns.
             # Only the currently rendered screen is evidence about the current turn.
-            fresh_output = get_backend().get_history(
-                provider.session_name,
-                provider.window_name,
-                strip_escapes=True,
-                visible_only=True,
+            fresh_output = (
+                capture()
+                if capture is not None
+                else get_backend().get_history(
+                    provider.session_name,
+                    provider.window_name,
+                    strip_escapes=True,
+                    visible_only=True,
+                )
             )
         except Exception as e:
             logger.debug(
                 f"_fresh_capture_pane_status [{terminal_id}]: capture-pane read failed: {e}"
             )
+            self._discard_bootstrap_candidate(terminal_id, bootstrap_identity)
             return None
         if not fresh_output:
+            self._discard_bootstrap_candidate(terminal_id, bootstrap_identity)
             return None
 
         try:
@@ -902,7 +1066,22 @@ class StatusMonitor:
                 detected = provider.get_status(fresh_output)
         except Exception as e:
             logger.debug(f"_fresh_capture_pane_status [{terminal_id}]: detection failed: {e}")
+            self._discard_bootstrap_candidate(terminal_id, bootstrap_identity)
             return None
+
+        if identity_check is not None:
+            try:
+                if not identity_check():
+                    self._discard_bootstrap_candidate(terminal_id, bootstrap_identity)
+                    return None
+            except Exception:
+                self._discard_bootstrap_candidate(terminal_id, bootstrap_identity)
+                return None
+        with self._lock:
+            if bootstrap_identity is not None and not self._bootstrap_identity_current_locked(
+                terminal_id, bootstrap_identity
+            ):
+                return None
 
         if detected == TerminalStatus.PROCESSING or detected == TerminalStatus.UNKNOWN:
             # Not a ready candidate — nothing to confirm. Clear any pending one: a busy
@@ -912,13 +1091,19 @@ class StatusMonitor:
             # notify_input_sent/_process_chunk bump says nothing about a candidate
             # legitimately seeded after it.
             with self._lock:
-                if self._capture_generation.get(terminal_id, 0) == generation:
+                if self._capture_generation.get(terminal_id, 0) == generation and (
+                    bootstrap_identity is None
+                    or self._bootstrap_identity_current_locked(terminal_id, bootstrap_identity)
+                ):
                     self._pending_stale_capture.pop(terminal_id, None)
             return detected
 
         now = time.monotonic()
         with self._lock:
-            if self._capture_generation.get(terminal_id, 0) != generation:
+            if self._capture_generation.get(terminal_id, 0) != generation or (
+                bootstrap_identity is not None
+                and not self._bootstrap_identity_current_locked(terminal_id, bootstrap_identity)
+            ):
                 # The pane read straddled a turn/output boundary: the boundary already
                 # cleared the candidate map, and this verdict describes the pane from
                 # before it. Seeding it anyway would hand the NEXT poll (which pins the

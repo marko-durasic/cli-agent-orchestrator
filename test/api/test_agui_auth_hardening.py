@@ -7,9 +7,10 @@ closed either way; these tests pin the *clean* failure mode.
 
 Two layers:
 
-* the malformed-token cases run the REAL ``extract_scopes_from_token``
-  (a token without three segments fails header parsing before any JWKS
-  network I/O, so the test is deterministic and offline), and
+* the malformed-token case runs the REAL ``extract_scopes_from_token`` with
+  an in-process JWKS lookup. Production eagerly fetches keys before parsing;
+  this unit boundary skips that fetch and explicitly forbids network I/O,
+  while retaining PyJWT's real malformed-header parsing, and
 * the expired-token case simulates the post-JWKS validation failure by
   raising ``jwt.ExpiredSignatureError`` from the extractor, pinning that ANY
   parse exception maps to 401 (full signature+expiry validation against a
@@ -26,6 +27,7 @@ from fastapi.testclient import TestClient
 
 import cli_agent_orchestrator.api.main as main
 from cli_agent_orchestrator.api.main import app
+from cli_agent_orchestrator.security import auth
 
 client = TestClient(app, base_url="http://localhost")
 
@@ -39,8 +41,19 @@ def _agui_on_auth_on(monkeypatch):
 
 
 class TestStreamEndpoint:
-    def test_malformed_token_returns_401_not_500(self):
+    def test_malformed_token_returns_401_not_500(self, monkeypatch):
+        monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
+        key_client = jwt.PyJWKClient("https://unit-test-tenant.invalid/.well-known/jwks.json")
+        fetches = []
+
+        def forbidden_fetch():
+            fetches.append(True)
+            raise AssertionError("Malformed-token unit test must not fetch external keys")
+
+        monkeypatch.setattr(key_client, "fetch_data", forbidden_fetch)
+        monkeypatch.setattr(auth.get_jwks_cache(), "get_client", lambda _uri: key_client)
         resp = client.get("/agui/v1/stream", params={"access_token": "not-a-jwt"})
+        assert fetches == []  # the endpoint catches exceptions, so assert outside it
         assert resp.status_code == 401
         assert "invalid" in resp.text.lower() or "expired" in resp.text.lower()
 
