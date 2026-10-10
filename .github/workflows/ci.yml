@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, feat/ollama-on-2.5.1, release/cao-supervisor-compatible-20261010]
 
 permissions:
   contents: read
