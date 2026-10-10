@@ -3559,6 +3559,45 @@ async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDire
         )
 
 
+class RecoverTerminalOutputBody(BaseModel):
+    """Caller preconditions for one existing terminal; no implicit fleet sweep."""
+
+    model_config = {"extra": "forbid"}
+    expected_session: str = Field(min_length=1, max_length=255)
+    expected_window: str = Field(min_length=1, max_length=255)
+
+
+@app.post("/terminals/{terminal_id}/output/recover")
+async def recover_terminal_output(
+    terminal_id: TerminalId,
+    body: RecoverTerminalOutputBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Repair this terminal's monitoring without restarting or driving its CLI.
+
+    A genuine ready status may release already queued inbox messages through
+    the existing delivery gate. Unknown/busy statuses are never overridden.
+    """
+    from cli_agent_orchestrator.services import terminal_output_recovery
+
+    try:
+        return await asyncio.to_thread(
+            terminal_output_recovery.recover_output,
+            terminal_id,
+            expected_session=body.expected_session,
+            expected_window=body.expected_window,
+        )
+    except terminal_output_recovery.OutputRecoveryConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception:
+        logger.exception("Targeted output recovery failed for terminal %s", terminal_id)
+        raise HTTPException(
+            status_code=503, detail="Terminal output recovery could not be verified"
+        )
+
+
 @app.post("/terminals/{terminal_id}/input")
 async def send_terminal_input(
     request: Request,

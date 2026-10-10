@@ -145,6 +145,18 @@ class TmuxBackend(TerminalBackend):
 
     # --- Pipe-pane ---
 
+    def pin_output_target(self, session_name: str, window_name: str):
+        return self._client.pin_output_target(session_name, window_name)
+
+    def capture_output_target(self, session_name, window_name, expected_identity) -> str:
+        return self._client.capture_output_target(session_name, window_name, expected_identity)
+
+    def output_target_is_piped(self, session_name, window_name, expected_identity) -> bool:
+        return self._client.output_target_is_piped(session_name, window_name, expected_identity)
+
+    def rearm_output_target(self, session_name, window_name, expected_identity, file_path) -> None:
+        self._client.rearm_output_target(session_name, window_name, expected_identity, file_path)
+
     def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
         self._client.pipe_pane(session_name, window_name, file_path)
 

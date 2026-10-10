@@ -1605,6 +1605,72 @@ class TmuxClient:
             logger.error(f"Failed to get pane command for {session_name}:{window_name}: {e}")
             return None
 
+    @staticmethod
+    def _output_recovery_flag(pane: Pane, name: str) -> str:
+        # libtmux does not expose pane_dead/pane_pipe as Pane attributes.
+        result = pane.cmd("display-message", "-p", "#{" + name + "}")
+        if result.stderr or len(result.stdout) != 1 or result.stdout[0] not in ("0", "1"):
+            raise ValueError("Output recovery pane flag is unavailable")
+        return result.stdout[0]
+
+    def _output_recovery_pane(
+        self, session_name: str, window_name: str
+    ) -> Tuple[Pane, Tuple[str, ...]]:
+        """Resolve one live pane without guessing across split/replaced windows."""
+        session = self._find_session(session_name)
+        if session is None:
+            raise ValueError("Output recovery session is absent")
+        window = self._find_window(session, session_name, window_name)
+        if window is None:
+            raise ValueError("Output recovery window is absent")
+        panes = self._read_listing("output recovery panes", lambda: list(window.panes))
+        if len(panes) != 1 or self._output_recovery_flag(panes[0], "pane_dead") != "0":
+            raise ValueError("Output recovery requires exactly one live pane")
+        pane = panes[0]
+        identity = tuple(
+            str(value)
+            for value in (session.session_id, window.window_id, pane.pane_id, pane.pane_pid)
+        )
+        if not all(
+            re.fullmatch(pattern, value)
+            for pattern, value in zip((r"\$\d+", r"@\d+", r"%\d+", r"[1-9]\d*"), identity)
+        ):
+            raise ValueError("Output recovery pane identity is unavailable")
+        return pane, identity
+
+    def pin_output_target(self, session_name: str, window_name: str) -> Tuple[str, ...]:
+        """Read immutable session/window/pane/process identity for targeted recovery."""
+        return self._output_recovery_pane(session_name, window_name)[1]
+
+    def _checked_output_pane(self, session_name, window_name, expected_identity):
+        pane, identity = self._output_recovery_pane(session_name, window_name)
+        if identity != expected_identity:
+            raise ValueError("Output recovery pane identity changed")
+        return pane
+
+    def capture_output_target(self, session_name, window_name, expected_identity) -> str:
+        """Capture only the pinned pane's visible viewport, never scrollback."""
+        pane = self._checked_output_pane(session_name, window_name, expected_identity)
+        result = pane.cmd("capture-pane", "-p", "-S", "0")
+        if result.stderr:
+            raise RuntimeError("Output recovery viewport capture failed")
+        self._checked_output_pane(session_name, window_name, expected_identity)
+        return "\n".join(result.stdout)
+
+    def output_target_is_piped(self, session_name, window_name, expected_identity) -> bool:
+        pane = self._checked_output_pane(session_name, window_name, expected_identity)
+        return self._output_recovery_flag(pane, "pane_pipe") == "1"
+
+    def rearm_output_target(self, session_name, window_name, expected_identity, file_path) -> None:
+        """Replace only a pinned pane's output forwarder, never its foreground CLI."""
+        pane = self._checked_output_pane(session_name, window_name, expected_identity)
+        if pane.cmd("pipe-pane").stderr:
+            raise RuntimeError("Output recovery could not stop the old forwarder")
+        self._checked_output_pane(session_name, window_name, expected_identity)
+        if pane.cmd("pipe-pane", "-o", f"cat >> {shlex.quote(str(file_path))}").stderr:
+            raise RuntimeError("Output recovery could not attach the forwarder")
+        self._checked_output_pane(session_name, window_name, expected_identity)
+
     def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
         """Start piping pane output to file.
 
