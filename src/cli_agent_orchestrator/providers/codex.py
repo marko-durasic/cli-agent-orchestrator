@@ -933,9 +933,9 @@ class CodexProvider(BaseProvider):
             # restrictions are active (not unrestricted "*").
             if self._allowed_tools and "*" not in self._allowed_tools:
                 from cli_agent_orchestrator.constants import SECURITY_PROMPT
+                from cli_agent_orchestrator.utils.tool_mapping import format_codex_tool_constraints
 
-                tools_list = ", ".join(self._allowed_tools)
-                tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
+                tool_constraint = format_codex_tool_constraints(self._allowed_tools)
                 system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
 
             if system_prompt:

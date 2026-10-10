@@ -30,7 +30,7 @@ name: cargo-deny
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, feat/ollama-on-2.5.1]
   schedule:
     # Mondays 07:30 UTC — half an hour after secret-scan.yml's 07:00 gitleaks sweep, so the
     # two weekly jobs do not contend for runners.
