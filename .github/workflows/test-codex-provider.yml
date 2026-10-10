@@ -13,7 +13,7 @@ on:
       - 'pyproject.toml'
       - '.github/workflows/test-codex-provider.yml'
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main, develop, feat/ollama-on-2.5.1, release/cao-supervisor-compatible-20261010 ]
     paths:
       - 'src/cli_agent_orchestrator/providers/codex.py'
       - 'test/providers/test_codex_provider_unit.py'
