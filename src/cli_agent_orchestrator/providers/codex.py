@@ -1197,6 +1197,206 @@ class CodexProvider(BaseProvider):
         self._initialized = True
         return True
 
+    # A status snapshot alone cannot identify which dispatch produced it.
+    supports_direct_status_probe = True
+    requires_delivery_correlation = True
+
+    @staticmethod
+    def _startup_view(output: str) -> tuple[str, bool]:
+        """Separate transcript from composer without discarding pending input."""
+        clean = strip_terminal_escapes(output)
+        lines = clean.splitlines()
+        footer = next(
+            (
+                i
+                for i in range(len(lines) - 1, max(-1, len(lines) - IDLE_PROMPT_TAIL_LINES - 1), -1)
+                if re.search(TUI_FOOTER_PATTERN, lines[i])
+            ),
+            None,
+        )
+        if footer is None:
+            return clean, False
+        composer = next(
+            (
+                i
+                for i in range(footer - 1, -1, -1)
+                if re.match(rf"^\s*{IDLE_PROMPT_PATTERN}", lines[i])
+            ),
+            None,
+        )
+        if composer is None:
+            return "\n".join(lines[:footer]), True  # incomplete frame, not proof
+        rows = [line for line in lines[composer:footer] if line.strip()]
+        # v0.111 displays a filename-expanded suggestion above the %-left
+        # footer. Preserve its existing display-status behavior. A user draft
+        # can resemble a suggestion: delivery correlation below is mandatory
+        # even for this shape; a suggestion never proves submission.
+        legacy_hint = len(rows) == 1 and (
+            re.search(r"\b\d{1,3}%\s+left\b", lines[footer])
+            and re.fullmatch(rf"\s*{IDLE_PROMPT_PATTERN} Write tests for @\S+", rows[0])
+        )
+        empty = len(rows) == 1 and (
+            re.fullmatch(IDLE_PROMPT_STRICT_PATTERN, rows[0])
+            or re.fullmatch(STARTUP_IDLE_PLACEHOLDER_PATTERN, rows[0])
+            or legacy_hint
+        )
+        return "\n".join(lines[:composer]), not bool(empty)
+
+    @staticmethod
+    def _startup_provenance(output: str) -> tuple[str, bool]:
+        """Remove examples before interpreting any prompt or native-cell marker.
+
+        A fence may itself contain complete user/composer/footer lookalikes.
+        Keep line boundaries, and fail closed for an unterminated capture.
+        Single-backtick block rows are ambiguous but also treated as quotes.
+        """
+        rows = []
+        fence = None
+        quoted = False
+        for line in strip_terminal_escapes(output).splitlines():
+            marker = re.match(r"^[ \t]*(`+|~{3,})(.*)$", line)
+            if fence is not None:
+                rows.append("")
+                if marker and marker.group(1) == fence and not marker.group(2).strip():
+                    fence = None
+                continue
+            if marker:
+                quoted = True
+                fence = marker.group(1)
+                rows.append("")
+            elif re.match(r"^[ \t]*>", line):
+                quoted = True
+                rows.append("")
+            else:
+                rows.append(line)
+        if fence is not None:
+            return "", True
+        return "\n".join(rows), quoted
+
+    @staticmethod
+    def _startup_turn(output: str) -> str:
+        clean, _ = CodexProvider._startup_provenance(output)
+        body, pending = CodexProvider._startup_view(clean)
+        if pending:
+            return ""
+        users = list(re.finditer(USER_PREFIX_PATTERN, body, re.MULTILINE))
+        if users:
+            # Select a turn only after quoted prompt markers are excluded.
+            end = body.find("\n", users[-1].start())
+            body = body[end + 1 :] if end >= 0 else ""
+        return body
+
+    def startup_failure_reason(self, output: str) -> str | None:
+        if re.search(
+            r"^■ exceeded retry limit, last status: 429 Too Many Requests[ \t]*$",
+            self._startup_turn(output),
+            re.MULTILINE,
+        ):
+            return "rate_limited_429"
+        return None
+
+    @staticmethod
+    def _dispatch_parts(body: str) -> list[tuple[str, str]]:
+        """Submitted prompt plus subsequent native response, before the composer."""
+        body, quoted = CodexProvider._startup_provenance(body)
+        if quoted:
+            return []
+        users = list(re.finditer(USER_PREFIX_PATTERN, body, re.MULTILINE))
+        turns = []
+        for i, user in enumerate(users):
+            stop = users[i + 1].start() if i + 1 < len(users) else len(body)
+            turn = body[user.start() : stop]
+            turn = re.sub(r"^(?:You\b|[›»])[^\S\n]*", "", turn, count=1)
+            response = re.search(r"^(?:• |■ |assistant:|codex:|agent:)", turn, re.MULTILINE)
+            split = response.start() if response else len(turn)
+            turns.append((turn[:split], turn[split:]))
+        return turns
+
+    def startup_delivery_evidence(
+        self,
+        output: str,
+        message: str | None,
+        baseline_output: str | None,
+    ) -> str:
+        """Fail closed unless a fresh submitted turn is bound to this send.
+
+        A rolling/truncated capture or a repeated indistinguishable turn is
+        uncertain. No status, composer text or historical receipt substitutes
+        for the pre-send baseline and the current dispatch's prompt.
+        """
+        if not message or baseline_output is None:
+            return "unknown"
+        # A partial render cannot establish chronology or a ready composer.
+        for snapshot in (baseline_output, output):
+            _, quoted = self._startup_provenance(snapshot)
+            if quoted:
+                # Text-only captures cannot establish native cell provenance
+                # inside a quoted transcript. Never latch acceptance from it.
+                return "unknown"
+            rows = strip_terminal_escapes(snapshot).splitlines()
+            if not any(
+                re.search(TUI_FOOTER_PATTERN, row) for row in rows[-IDLE_PROMPT_TAIL_LINES:]
+            ):
+                return "unknown"
+        body, pending = self._startup_view(output)
+        before, was_pending = self._startup_view(baseline_output)
+
+        def normalize(text: str) -> str:
+            # Keep word boundaries. Ambiguous mid-word terminal wrapping is
+            # uncertainty, not permission to match a different dispatched task.
+            return " ".join(text.split())
+
+        if pending or was_pending or not normalize(body).startswith(normalize(before)):
+            return "unknown"
+        expected = normalize(message)
+        turns = self._dispatch_parts(body)
+        old = self._dispatch_parts(before)
+
+        def matches(prompt: str) -> bool:
+            # The existing memory plugin may prepend this explicit wrapper.
+            # Everything else must match the complete dispatched message;
+            # a different task merely ending in that text is not correlated.
+            prompt = re.sub(
+                r"^\s*<cao-memory>.*?</cao-memory>\s*",
+                "",
+                prompt,
+                count=1,
+                flags=re.DOTALL,
+            )
+            return normalize(prompt) == expected
+
+        def matching(pairs: list[tuple[str, str]]) -> int:
+            return sum(matches(prompt) for prompt, _ in pairs)
+
+        if not turns or matching(turns) <= matching(old):
+            return "unknown"
+        prompt, response = turns[-1]
+        if not matches(prompt) or not response:
+            return "unknown"
+        failure = self.startup_failure_reason(output)
+        if failure:
+            return failure
+        turn = self._startup_turn(output)
+        if (
+            re.search(
+                r"^• (?:Ran \S[^\n]*|Called [\w-]+\.[\w-]+\([^\n]*)\n[ \t]*└",
+                turn,
+                re.MULTILINE,
+            )
+            or re.search(TUI_PROGRESS_PATTERN, turn, re.MULTILINE)
+            or _find_assistant_marker(turn) is not None
+        ):
+            return "accepted"
+        return "unknown"
+
+    def has_task_acceptance(
+        self,
+        output: str,
+        message: str | None = None,
+        baseline_output: str | None = None,
+    ) -> bool:
+        return self.startup_delivery_evidence(output, message, baseline_output) == "accepted"
+
     def get_status(self, output: str) -> TerminalStatus:
         # Native status (herdr): trust the backend's agent state when available;
         # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
@@ -1209,6 +1409,8 @@ class CodexProvider(BaseProvider):
         output = self._resolve_buffer(output)
         if not output:
             return TerminalStatus.UNKNOWN
+        if self.startup_failure_reason(output):
+            return TerminalStatus.ERROR
 
         # Detect when the codex process has exited and the pane is back to a
         # bare shell. The pane's current command will revert to the shell
@@ -1328,6 +1530,10 @@ class CodexProvider(BaseProvider):
         # it through this one call, so the two cannot disagree.
         if _has_approval_prompt_in_bottom(clean_output):
             return TerminalStatus.WAITING_USER_ANSWER
+
+        _, pending_dispatch = self._startup_view(clean_output)
+        if pending_dispatch and not re.search(TUI_PROGRESS_PATTERN, tail_output, re.MULTILINE):
+            return TerminalStatus.IDLE
 
         # Check bottom of captured output for idle prompt.
         # With --no-alt-screen, scrollback contains history so we can't anchor

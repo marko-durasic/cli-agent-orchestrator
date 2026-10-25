@@ -1003,11 +1003,10 @@ def _notify_caller_of_deferred_failure(
 # wrong the Enter (or the whole paste) is dropped and the message sits
 # unsubmitted in the prompt box. In the deferred-init path nobody blocks on
 # completion, so a dropped submit leaves the worker IDLE forever with the task
-# never started and NO exception raised — the supervisor then waits on a
-# callback that can never arrive. Confirm the worker actually began processing
-# and re-submit if it did not.
+# never started and NO exception raised. Conversely, cached IDLE may hide
+# actual execution. Confirm acceptance, but retain uncertainty without replay
+# or destructive teardown; a missing status edge is not proof of non-delivery.
 _DEFERRED_SUBMIT_CONFIRM_TIMEOUT = 8.0  # per-attempt wait for the PROCESSING edge
-_DEFERRED_SUBMIT_MAX_RESUBMITS = 3
 # Statuses proving the worker accepted the task (left the ready IDLE state).
 # WAITING_USER_ANSWER counts: the worker consumed the input and is now asking.
 _DEFERRED_STARTED_STATUSES = {
@@ -1017,7 +1016,13 @@ _DEFERRED_STARTED_STATUSES = {
 }
 
 
-def _worker_is_started_direct(terminal_id: str, provider) -> bool:
+def _worker_is_started_direct(
+    terminal_id: str,
+    provider,
+    *,
+    message: str | None = None,
+    baseline_output: str | None = None,
+) -> bool:
     """Direct visible-screen status check bypassing the event-driven status cache.
 
     The deferred-init retry loop polls ``status_monitor.get_status()`` which
@@ -1030,6 +1035,11 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
     (not the 8 KB rolling buffer, which is too small to reliably hold the
     footer) and calls ``provider.get_status()`` directly, catching the real
     state so the retry loop doesn't re-deliver into a working terminal.
+
+    With ``message`` supplied, correlation-capable providers must prove that
+    specific delivery against ``baseline_output``. Without it, this remains
+    the shared conservative replay guard (prior activity may block replay,
+    but is not proof that any new dispatch was accepted).
 
     Only providers that set ``supports_direct_status_probe = True`` should
     be passed to this function; the ``get_status()`` contract for other
@@ -1046,7 +1056,15 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
         if not session_name or not window_name:
             return False
         output = get_backend().get_history(session_name, window_name, tail_lines=200)
+        if (
+            message is not None
+            and getattr(provider, "requires_delivery_correlation", False) is True
+        ):
+            return provider.has_task_acceptance(output, message, baseline_output) is True
         status = provider.get_status(output)
+        accepted = getattr(provider, "has_task_acceptance", None)
+        if status != TerminalStatus.ERROR and callable(accepted) and accepted(output) is True:
+            return True
     except Exception:
         logger.debug(
             "Direct status probe for %s failed (falling through to cached path)",
@@ -1123,10 +1141,9 @@ def redeliver_dropped_message(
     When the gate is on and the provider is not probe-capable, the
     bare-Enter branch (which cannot duplicate a task) is still taken
     whenever the text is visible; otherwise nothing is sent and False is
-    returned, leaving the caller's own timeout to classify the outcome. The
-    deferred-init path keeps the default (off) because it loops on
-    ``wait_until_status`` for the PROCESSING edge before ever reaching here,
-    and that pre-existing behavior is unchanged by this helper's extraction.
+    returned, leaving the caller's own timeout to classify the outcome.
+    Deferred startup no longer invokes this redelivery helper: an uncertain
+    status edge cannot establish that the assigned task was never accepted.
 
     Returns True when the worker was found already started and nothing was
     sent; False when a redelivery was attempted (or deliberately skipped).
@@ -1176,6 +1193,17 @@ def redeliver_dropped_message(
     return False
 
 
+def _capture_startup_baseline(terminal_id: str) -> str | None:
+    """Ephemeral bounded pre-send snapshot; never log arbitrary terminal text."""
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+        return get_backend().get_history(
+            metadata["tmux_session"], metadata["tmux_window"], tail_lines=200
+        )
+    except Exception:  # noqa: BLE001 -- unavailable observation is uncertainty
+        return None
+
+
 async def _confirm_worker_started_or_resubmit(
     terminal_id: str,
     message: str,
@@ -1183,46 +1211,80 @@ async def _confirm_worker_started_or_resubmit(
     sender_id: Optional[str],
     orchestration_type: Optional[OrchestrationType],
     provider=None,
+    baseline_output: str | None = None,
 ) -> bool:
-    """Confirm a deferred-init worker began processing; re-submit if not.
+    """Confirm acceptance once; absence of evidence is not a dropped input.
 
-    Returns True once the terminal reaches a started status, False if it is
-    still stuck at IDLE after all resubmit attempts. Blocking tmux/DB I/O runs
-    off the loop via to_thread so concurrent deferred inits aren't frozen.
+    Keep the historical name for callers, but never resend (including Enter).
+    Positive status or tool evidence latches acceptance by returning immediately.
+    A stale cache, failed capture or empty composer cannot authorize replay.
     """
-    if await wait_until_status(
+    observed_status = await wait_until_status(
         terminal_id,
         _DEFERRED_STARTED_STATUSES,
         timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
         polling_interval=0.5,
-    ):
-        return True
-
-    for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
-        # The redelivery decision (box check + #496's direct-probe guard for
-        # providers that opt in) lives in ``redeliver_dropped_message`` —
-        # shared with the synchronous step path (#562).
-        already_started = await asyncio.to_thread(
-            redeliver_dropped_message,
+    )
+    if provider is not None and getattr(provider, "requires_delivery_correlation", False) is True:
+        accepted = await asyncio.to_thread(
+            _worker_is_started_direct,
             terminal_id,
-            message,
-            attempt,
             provider,
-            registry=registry,
-            sender_id=sender_id,
-            orchestration_type=orchestration_type,
+            message=message,
+            baseline_output=baseline_output,
         )
-        if already_started:
-            return True
-        if await wait_until_status(
-            terminal_id,
-            _DEFERRED_STARTED_STATUSES,
-            timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
-            polling_interval=0.5,
-        ):
-            return True
-
+        if accepted:
+            logger.info("Worker %s startup accepted: current-delivery evidence", terminal_id)
+        return accepted
+    if observed_status:
+        logger.info("Worker %s startup accepted: observed started status", terminal_id)
+        return True
+    if (
+        provider is not None
+        and getattr(provider, "supports_direct_status_probe", False)
+        and await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider)
+    ):
+        logger.info("Worker %s startup accepted: direct execution evidence", terminal_id)
+        return True
     return False
+
+
+def _startup_failure_receipt(
+    terminal_id: str,
+    provider,
+    message: str | None = None,
+    baseline_output: str | None = None,
+) -> str:
+    """Bounded, non-secret failure evidence; preserve the terminal and its logs.
+
+    Never copy arbitrary terminal text (possibly sensitive) into the inbox.
+    Only a recognized provider category is retained in this receipt.
+    """
+    category = "startup_unknown"
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+        output = get_backend().get_history(
+            metadata["tmux_session"], metadata["tmux_window"], tail_lines=200
+        )
+        correlated = getattr(provider, "requires_delivery_correlation", False) is True
+        evidence = (
+            provider.startup_delivery_evidence(output, message, baseline_output)
+            if correlated
+            else None
+        )
+        failure = getattr(provider, "startup_failure_reason", None)
+        if evidence == "rate_limited_429" or (
+            not correlated and callable(failure) and failure(output) == "rate_limited_429"
+        ):
+            category = "rate_limited_429 (429 Too Many Requests; cause unknown)"
+        elif not correlated and provider.get_status(output) == TerminalStatus.ERROR:
+            category = "provider_error"
+    except Exception:  # noqa: BLE001 -- failed observation must retain uncertain work
+        category = "startup_unknown (evidence unavailable)"
+    return (
+        f"Worker {terminal_id}: {category}; worker and output logs retained. "
+        "No automatic resend, retry, deletion or replacement. Inspect the existing worker."
+    )
 
 
 def _schedule_deferred_init(
@@ -1240,7 +1302,8 @@ def _schedule_deferred_init(
     time this runs, a failure here must be made OBSERVABLE to the supervisor
     rather than silently swallowed — otherwise the supervisor waits forever
     on a callback that can never arrive and a later inspect 404s. On failure
-    we notify the caller's inbox (best-effort) and then tear the worker down.
+    we notify the caller's inbox (best-effort). Uncertain delivery retains the
+    worker and output logs; only failure before any send may tear it down.
 
     ``TerminalInputBlockedError`` (the worker is parked on a WAITING_USER_ANSWER
     prompt right after init) is NOT a teardown case: the worker is alive and
@@ -1249,6 +1312,8 @@ def _schedule_deferred_init(
 
     async def _run() -> None:
         caller_id: Optional[str] = None
+        delivery_attempted = False
+        baseline_output = None
         try:
             await provider_instance.initialize()
             shell_command = provider_instance.shell_baseline
@@ -1280,6 +1345,9 @@ def _schedule_deferred_init(
                 effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
                 # send_input is blocking tmux I/O — off the loop so it can't
                 # freeze the server for concurrent requests.
+                baseline_output = await asyncio.to_thread(_capture_startup_baseline, terminal_id)
+                # A transport exception after this point cannot prove non-delivery.
+                delivery_attempted = True
                 await asyncio.to_thread(
                     send_input,
                     terminal_id,
@@ -1288,38 +1356,31 @@ def _schedule_deferred_init(
                     sender_id=caller_id,
                     orchestration_type=effective_orchestration_type,
                 )
-                # Delivery can be silently dropped (Enter swallowed / paste lost)
-                # when the TUI isn't input-ready. Confirm the worker actually
-                # started and re-submit if not; if it never starts, surface the
-                # failure so the supervisor re-routes instead of waiting forever.
+                # Observe acceptance without replaying an uncertain task.
                 started = await _confirm_worker_started_or_resubmit(
                     terminal_id,
                     initial_message,
                     registry,
                     caller_id,
-                    # Same guard-eligible default as the initial send_input above --
-                    # a resubmit is still an unattended initial-task delivery, so it
-                    # must not silently drop back to the unguarded original type.
                     effective_orchestration_type,
                     provider=provider_instance,
+                    baseline_output=baseline_output,
                 )
                 if not started:
-                    logger.error(
-                        "Deferred init for %s: worker never started after "
-                        "resubmits; task not delivered — notifying caller and "
-                        "tearing down.",
+                    receipt = await asyncio.to_thread(
+                        _startup_failure_receipt,
                         terminal_id,
+                        provider_instance,
+                        initial_message,
+                        baseline_output,
                     )
+                    logger.error("Deferred init: %s", receipt)
                     await asyncio.to_thread(
                         _notify_caller_of_deferred_failure,
                         terminal_id,
-                        (
-                            f"Worker {terminal_id} received the assigned task but "
-                            f"never started processing (input not accepted after "
-                            f"retries). It has been deleted — re-assign the task."
-                        ),
+                        receipt,
                         registry,
-                        True,  # delete_worker
+                        False,  # uncertain acceptance never authorizes deletion
                     )
                     return
         except TerminalInputBlockedError as e:
@@ -1345,24 +1406,22 @@ def _schedule_deferred_init(
                 registry,
                 delete_worker=False,
             )
-        except Exception as e:
-            # exc_info=True preserves the traceback for debugging; {e!r} avoids
-            # newline/control-character injection into logs and the inbox message
-            # (the exception text can contain provider-supplied content).
-            logger.error(
-                "Deferred init for terminal %s failed: %r. "
-                "Notifying caller and tearing down worker.",
-                terminal_id,
-                e,
-                exc_info=True,
+        except Exception as e:  # noqa: BLE001 -- async boundary must retain uncertain delivery
+            # Before delivery, init failure is known; after a send attempt the
+            # outcome is uncertain even when the transport raised. Retain evidence
+            # without copying unbounded/provider-supplied exception text.
+            receipt = f"Worker {terminal_id}: {type(e).__name__[:80]} during " + (
+                "delivery; worker retained; no automatic retry or replacement."
+                if delivery_attempted
+                else "initialization; worker deleted."
             )
+            logger.error("Deferred init: %s", receipt)
             await asyncio.to_thread(
                 _notify_caller_of_deferred_failure,
                 terminal_id,
-                f"Worker {terminal_id} failed to initialize: {e!r}. It has been "
-                f"deleted — re-assign the task or report the failure.",
+                receipt,
                 registry,
-                delete_worker=True,
+                delete_worker=not delivery_attempted,
             )
 
     try:
