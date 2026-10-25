@@ -160,8 +160,8 @@ class TestConfirmWorkerStartedOrResubmit:
         send.assert_not_called()
 
     async def test_enter_resubmit_when_message_in_box(self):
-        # First confirm fails, box shows our text (Enter swallowed) → bare Enter,
-        # second confirm succeeds.
+        # Visible input cannot distinguish dropped Enter from a queued duplicate.
+        # No Enter or replay is allowed on uncertain startup.
         with (
             patch.object(ts, "wait_until_status", new=AsyncMock(side_effect=[False, True])),
             patch.object(ts, "_message_visible_in_box", return_value=True),
@@ -171,12 +171,12 @@ class TestConfirmWorkerStartedOrResubmit:
             ok = await ts._confirm_worker_started_or_resubmit(
                 "t1", "Analyze the logs", None, "sup", None
             )
-        assert ok is True
-        key.assert_called_once_with("t1", "Enter")
+        assert ok is False
+        key.assert_not_called()
         send.assert_not_called()
 
     async def test_full_redeliver_when_box_empty(self):
-        # First confirm fails, box empty (paste dropped) → re-deliver full msg.
+        # An empty box cannot establish that a paste was dropped; do not replay.
         with (
             patch.object(ts, "wait_until_status", new=AsyncMock(side_effect=[False, True])),
             patch.object(ts, "_message_visible_in_box", return_value=False),
@@ -186,14 +186,12 @@ class TestConfirmWorkerStartedOrResubmit:
             ok = await ts._confirm_worker_started_or_resubmit(
                 "t1", "Analyze the logs", "reg", "sup", None
             )
-        assert ok is True
+        assert ok is False
         key.assert_not_called()
-        send.assert_called_once()
-        assert send.call_args.args[0] == "t1"
-        assert send.call_args.args[1] == "Analyze the logs"
+        send.assert_not_called()
 
     async def test_returns_false_when_worker_never_starts(self):
-        # Every confirm fails through all resubmit attempts.
+        # No positive acceptance: report uncertainty without retrying.
         with (
             patch.object(ts, "wait_until_status", new=AsyncMock(return_value=False)),
             patch.object(ts, "_message_visible_in_box", return_value=True),
@@ -228,7 +226,7 @@ class TestConfirmWorkerStartedOrResubmit:
         send.assert_not_called()
 
     async def test_direct_probe_falls_through_when_worker_not_started(self):
-        # Direct probe returns False → continues to existing resubmit logic.
+        # A negative direct probe is uncertainty, not permission to resubmit.
         provider = MagicMock(supports_direct_status_probe=True)
         with (
             patch.object(ts, "wait_until_status", new=AsyncMock(side_effect=[False, True])),
@@ -245,13 +243,13 @@ class TestConfirmWorkerStartedOrResubmit:
                 None,
                 provider=provider,
             )
-        assert ok is True
-        key.assert_called_once()
+        assert ok is False
+        key.assert_not_called()
         send.assert_not_called()
 
     async def test_direct_probe_skipped_when_provider_not_opted_in(self):
         # Provider without supports_direct_status_probe → direct probe never
-        # invoked; falls through to existing resubmit logic.
+        # invoked; preserve uncertainty without resubmitting.
         provider = MagicMock(supports_direct_status_probe=False)
         with (
             patch.object(ts, "wait_until_status", new=AsyncMock(side_effect=[False, True])),
@@ -268,7 +266,7 @@ class TestConfirmWorkerStartedOrResubmit:
                 None,
                 provider=provider,
             )
-        assert ok is True
+        assert ok is False
         probe.assert_not_called()
 
     async def test_provider_none_skips_direct_probe(self):
@@ -288,7 +286,7 @@ class TestConfirmWorkerStartedOrResubmit:
                 None,
                 provider=None,
             )
-        assert ok is True
+        assert ok is False
         probe.assert_not_called()
 
 
